@@ -34,10 +34,10 @@ app.notFound((c) => {
 	return c.json({ error: 'Not found' }, 404);
 });
 
-// 全局错误处理
+// 全局错误处理（临时暴露 detail 用于调试，修完后改回去）
 app.onError((err, c) => {
 	console.error('Unhandled error:', err);
-	return c.json({ error: 'Internal server error' }, 500);
+	return c.json({ error: 'Internal server error', detail: err.message }, 500);
 });
 
 export default app;
