@@ -28,7 +28,7 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
 			method: 'GET',
 			headers: {
 				'X-Appwrite-Project': c.env.APPWRITE_PROJECT_ID,
-				Authorization: `Bearer ${jwt}`,
+				'X-Appwrite-JWT': jwt,
 				'Content-Type': 'application/json',
 			},
 		});
