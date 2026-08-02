@@ -81,9 +81,9 @@ files.post('/upload', async (c) => {
 	} else {
 		// 原始二进制流上传（客户端直接 PUT/POST body）
 		fileBody = c.req.raw.body as ReadableStream;
-		fileName = c.req.header('X-File-Name') || 'unnamed';
+		fileName = decodeURIComponent(c.req.header('X-File-Name') || 'unnamed');
 		mimeType = c.req.header('Content-Type') || 'application/octet-stream';
-		targetPath = normalizePath(c.req.header('X-File-Path') || '/');
+		targetPath = normalizePath(decodeURIComponent(c.req.header('X-File-Path') || '/'));
 
 		if (!fileBody) {
 			return c.json({ error: 'Empty request body' }, 400);
