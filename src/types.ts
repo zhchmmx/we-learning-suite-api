@@ -17,6 +17,7 @@ export interface AppEnv {
 	};
 	Variables: {
 		userId: string;
+		sessionId: string;
 	};
 }
 
@@ -28,6 +29,7 @@ export interface FileRecord {
 	r2_key: string;
 	size: number;
 	mime_type: string;
+	thumbnail_key: string | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -38,6 +40,7 @@ export interface FileMetadataResponse {
 	path: string;
 	size: number;
 	mimeType: string;
+	hasThumbnail: boolean;
 	createdAt: string;
 	updatedAt: string;
 }

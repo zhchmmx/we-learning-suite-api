@@ -4,7 +4,7 @@ import { generatePresignedUrl } from '../services/presign';
 
 const files = new Hono<AppEnv>();
 
-const BUCKET_NAME = 'we-learning-suite-files';
+const BUCKET_NAME = 'we-learning-suite';
 
 // ===== 工具函数 =====
 
@@ -15,6 +15,7 @@ function toResponse(record: FileRecord): FileMetadataResponse {
 		path: record.path,
 		size: record.size,
 		mimeType: record.mime_type,
+		hasThumbnail: !!record.thumbnail_key,
 		createdAt: record.created_at,
 		updatedAt: record.updated_at,
 	};
@@ -125,6 +126,7 @@ files.post('/upload', async (c) => {
 		r2_key: r2Key,
 		size: putResult.size,
 		mime_type: mimeType,
+		thumbnail_key: null,
 		created_at: now,
 		updated_at: now,
 	}) }, 201);
@@ -243,8 +245,15 @@ files.delete('/:id', async (c) => {
 		return c.json({ error: 'File not found' }, 404);
 	}
 
-	// 并行删除 R2 对象和 D1 记录
-	await Promise.all([c.env.R2_BUCKET.delete(record.r2_key), c.env.DB.prepare(`DELETE FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).run()]);
+	// 并行删除 R2 对象（含缩略图）和 D1 记录
+	const deleteOps: Promise<unknown>[] = [
+		c.env.R2_BUCKET.delete(record.r2_key),
+		c.env.DB.prepare(`DELETE FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).run(),
+	];
+	if (record.thumbnail_key) {
+		deleteOps.push(c.env.R2_BUCKET.delete(record.thumbnail_key));
+	}
+	await Promise.all(deleteOps);
 
 	return c.json({ data: { deleted: true, id: fileId } });
 });
@@ -312,6 +321,90 @@ files.patch('/:id', async (c) => {
 	const updated = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
 
 	return c.json({ data: toResponse(updated!) });
+});
+
+// ===== 缩略图端点 =====
+
+/**
+ * POST /:id/thumbnail
+ * 上传/更新文件缩略图
+ *
+ * 请求体：图片二进制流（image/webp 或 image/jpeg）
+ * 客户端负责生成缩略图，服务端只负责存储。
+ */
+files.post('/:id/thumbnail', async (c) => {
+	const userId = c.get('userId');
+	const fileId = c.req.param('id');
+
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+
+	if (!record) {
+		return c.json({ error: 'File not found' }, 404);
+	}
+
+	const body = c.req.raw.body;
+	if (!body) {
+		return c.json({ error: 'Empty request body' }, 400);
+	}
+
+	const contentType = c.req.header('Content-Type') || 'image/webp';
+	if (!contentType.startsWith('image/')) {
+		return c.json({ error: 'Content-Type must be an image type' }, 400);
+	}
+
+	// 缩略图 R2 key：userId/thumbnails/fileId.webp
+	const ext = contentType.includes('png') ? 'png' : contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'webp';
+	const thumbnailKey = `${userId}/thumbnails/${fileId}.${ext}`;
+
+	// 如果之前有缩略图且 key 不同，删除旧的
+	if (record.thumbnail_key && record.thumbnail_key !== thumbnailKey) {
+		await c.env.R2_BUCKET.delete(record.thumbnail_key);
+	}
+
+	// 存储缩略图
+	await c.env.R2_BUCKET.put(thumbnailKey, body, {
+		httpMetadata: { contentType },
+	});
+
+	// 更新 D1
+	const now = new Date().toISOString();
+	await c.env.DB.prepare(`UPDATE files SET thumbnail_key = ?, updated_at = ? WHERE id = ? AND user_id = ?`)
+		.bind(thumbnailKey, now, fileId, userId)
+		.run();
+
+	return c.json({ data: { fileId, thumbnailKey, contentType } }, 201);
+});
+
+/**
+ * GET /:id/thumbnail
+ * 获取文件缩略图（流式返回图片）
+ */
+files.get('/:id/thumbnail', async (c) => {
+	const userId = c.get('userId');
+	const fileId = c.req.param('id');
+
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+
+	if (!record) {
+		return c.json({ error: 'File not found' }, 404);
+	}
+
+	if (!record.thumbnail_key) {
+		return c.json({ error: 'No thumbnail for this file' }, 404);
+	}
+
+	const object = await c.env.R2_BUCKET.get(record.thumbnail_key);
+
+	if (!object) {
+		return c.json({ error: 'Thumbnail not found in storage' }, 404);
+	}
+
+	const headers = new Headers();
+	headers.set('Content-Type', object.httpMetadata?.contentType || 'image/webp');
+	headers.set('Cache-Control', 'public, max-age=86400');
+	headers.set('ETag', object.etag);
+
+	return new Response(object.body, { headers });
 });
 
 // ===== 预签名 URL 端点（大文件） =====

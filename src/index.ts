@@ -3,6 +3,7 @@ import { cors } from 'hono/cors';
 import type { AppEnv } from './types';
 import { authMiddleware } from './auth';
 import { files } from './routes/files';
+import { quiz } from './routes/quiz';
 
 const app = new Hono<AppEnv>();
 
@@ -12,7 +13,7 @@ app.use(
 	cors({
 		origin: '*',
 		allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-		allowHeaders: ['Content-Type', 'Authorization', 'X-File-Name', 'X-File-Path'],
+		allowHeaders: ['Content-Type', 'Authorization', 'X-File-Name', 'X-File-Path', 'X-Quiz-Ticket'],
 	})
 );
 
@@ -21,9 +22,12 @@ app.get('/health', (c) => {
 	return c.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// 所有 /api/files 路由需要鉴权
+// 文件管理路由（鉴权在各路由内部处理）
 app.use('/api/files/*', authMiddleware);
 app.route('/api/files', files);
+
+// We Quiz 路由（鉴权在各路由内部处理：JWT 或 ticket）
+app.route('/api/quiz', quiz);
 
 // 404 兜底
 app.notFound((c) => {
