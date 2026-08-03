@@ -29,6 +29,7 @@ export interface FileRecord {
 	r2_key: string;
 	size: number;
 	mime_type: string;
+	status: 'confirmed' | 'pending';
 	thumbnail_key: string | null;
 	created_at: string;
 	updated_at: string;

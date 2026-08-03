@@ -109,11 +109,11 @@ files.post('/upload', async (c) => {
 		return c.json({ error: 'Failed to upload file to storage' }, 500);
 	}
 
-	// 写入 D1 元数据
+	// 写入 D1 元数据（status 直接为 confirmed，因为文件已上传完成）
 	const now = new Date().toISOString();
 	await c.env.DB.prepare(
-		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)`
 	)
 		.bind(fileId, userId, fileName, targetPath, r2Key, putResult.size, mimeType, now, now)
 		.run();
@@ -126,6 +126,7 @@ files.post('/upload', async (c) => {
 		r2_key: r2Key,
 		size: putResult.size,
 		mime_type: mimeType,
+		status: 'confirmed',
 		thumbnail_key: null,
 		created_at: now,
 		updated_at: now,
@@ -155,15 +156,15 @@ files.get('/', async (c) => {
 	const params: (string | number)[] = [userId];
 
 	if (recursive) {
-		// 递归：列出该路径及所有子路径下的文件
+		// 递归：列出该路径及所有子路径下的文件（只返回已确认的文件）
 		const pathPrefix = path === '/' ? '/' : path;
-		query = `SELECT * FROM files WHERE user_id = ? AND (path = ? OR path LIKE ?) ORDER BY created_at DESC LIMIT ? OFFSET ?`;
-		countQuery = `SELECT COUNT(*) as total FROM files WHERE user_id = ? AND (path = ? OR path LIKE ?)`;
+		query = `SELECT * FROM files WHERE user_id = ? AND status = 'confirmed' AND (path = ? OR path LIKE ?) ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+		countQuery = `SELECT COUNT(*) as total FROM files WHERE user_id = ? AND status = 'confirmed' AND (path = ? OR path LIKE ?)`;
 		params.push(pathPrefix, `${pathPrefix}%`);
 	} else {
-		// 仅当前目录
-		query = `SELECT * FROM files WHERE user_id = ? AND path = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`;
-		countQuery = `SELECT COUNT(*) as total FROM files WHERE user_id = ? AND path = ?`;
+		// 仅当前目录（只返回已确认的文件）
+		query = `SELECT * FROM files WHERE user_id = ? AND status = 'confirmed' AND path = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+		countQuery = `SELECT COUNT(*) as total FROM files WHERE user_id = ? AND status = 'confirmed' AND path = ?`;
 		params.push(path);
 	}
 
@@ -184,13 +185,13 @@ files.get('/', async (c) => {
 
 /**
  * GET /:id
- * 获取单个文件的元信息
+ * 获取单个文件的元信息（只返回已确认的文件）
  */
 files.get('/:id', async (c) => {
 	const userId = c.get('userId');
 	const fileId = c.req.param('id');
 
-	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
 
 	if (!record) {
 		return c.json({ error: 'File not found' }, 404);
@@ -201,14 +202,14 @@ files.get('/:id', async (c) => {
 
 /**
  * GET /:id/download
- * 下载文件内容（从 R2 流式返回）
+ * 下载文件内容（从 R2 流式返回，只允许下载已确认的文件）
  */
 files.get('/:id/download', async (c) => {
 	const userId = c.get('userId');
 	const fileId = c.req.param('id');
 
-	// 先查元数据确认权限
-	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+	// 先查元数据确认权限（只允许已确认的文件）
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
 
 	if (!record) {
 		return c.json({ error: 'File not found' }, 404);
@@ -286,7 +287,8 @@ files.patch('/:id', async (c) => {
 		return c.json({ error: 'Invalid file name' }, 400);
 	}
 
-	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+	// 只允许修改已确认的文件
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
 
 	if (!record) {
 		return c.json({ error: 'File not found' }, 404);
@@ -318,7 +320,7 @@ files.patch('/:id', async (c) => {
 		.run();
 
 	// 返回更新后的记录
-	const updated = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+	const updated = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
 
 	return c.json({ data: toResponse(updated!) });
 });
@@ -336,7 +338,8 @@ files.post('/:id/thumbnail', async (c) => {
 	const userId = c.get('userId');
 	const fileId = c.req.param('id');
 
-	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+	// 只允许为已确认的文件上传缩略图
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
 
 	if (!record) {
 		return c.json({ error: 'File not found' }, 404);
@@ -383,7 +386,8 @@ files.get('/:id/thumbnail', async (c) => {
 	const userId = c.get('userId');
 	const fileId = c.req.param('id');
 
-	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+	// 只允许获取已确认文件的缩略图
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
 
 	if (!record) {
 		return c.json({ error: 'File not found' }, 404);
@@ -420,7 +424,7 @@ files.get('/:id/thumbnail', async (c) => {
  *   - mimeType: MIME 类型（可选）
  *
  * 返回预签名 URL，客户端直接 PUT 文件到该 URL。
- * 上传完成后需调用 POST /presign/confirm 确认。
+ * ⚠️ 上传完成后必须调用 POST /presign/confirm/:fileId 确认，否则文件不会被列出（防止幽灵文件）。
  */
 files.post('/presign/upload', async (c) => {
 	const userId = c.get('userId');
@@ -444,11 +448,11 @@ files.post('/presign/upload', async (c) => {
 	const fileId = crypto.randomUUID();
 	const r2Key = generateR2Key(userId, targetPath, fileId);
 
-	// 先在 D1 中创建记录（size 先写入，后续 confirm 时验证）
+	// 先在 D1 中创建记录，状态为 pending（等待客户端上传完成后 confirm）
 	const now = new Date().toISOString();
 	await c.env.DB.prepare(
-		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
 	)
 		.bind(fileId, userId, body.name, targetPath, r2Key, body.size, mimeType, now, now)
 		.run();
@@ -477,6 +481,52 @@ files.post('/presign/upload', async (c) => {
 });
 
 /**
+ * POST /presign/confirm/:fileId
+ * 确认预签名上传完成，将文件状态从 pending 改为 confirmed
+ *
+ * 客户端使用预签名 URL 上传完成后，必须调用此端点确认。
+ * 未确认的文件（pending 状态）不会在文件列表中显示。
+ */
+files.post('/presign/confirm/:fileId', async (c) => {
+	const userId = c.get('userId');
+	const fileId = c.req.param('fileId');
+
+	// 查找该文件的记录，必须是 pending 状态且属于当前用户
+	const record = await c.env.DB.prepare(
+		`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'pending'`
+	)
+		.bind(fileId, userId)
+		.first<FileRecord>();
+
+	if (!record) {
+		return c.json({ error: 'Pending file not found' }, 404);
+	}
+
+	// 验证 R2 中文件确实存在（防止客户端没上传就调 confirm）
+	const r2Object = await c.env.R2_BUCKET.head(record.r2_key);
+	if (!r2Object) {
+		return c.json({ error: 'File not found in storage. Please complete the upload first.' }, 400);
+	}
+
+	// 可选：验证文件大小是否匹配
+	if (record.size > 0 && r2Object.size !== record.size) {
+		return c.json({
+			error: 'File size mismatch',
+			expected: record.size,
+			actual: r2Object.size,
+		}, 400);
+	}
+
+	// 更新状态为 confirmed
+	const now = new Date().toISOString();
+	await c.env.DB.prepare(`UPDATE files SET status = 'confirmed', updated_at = ? WHERE id = ? AND user_id = ?`)
+		.bind(now, fileId, userId)
+		.run();
+
+	return c.json({ data: { fileId, status: 'confirmed' } });
+});
+
+/**
  * POST /presign/download/:id
  * 获取大文件下载的预签名 URL
  */
@@ -484,7 +534,8 @@ files.post('/presign/download/:id', async (c) => {
 	const userId = c.get('userId');
 	const fileId = c.req.param('id');
 
-	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).first<FileRecord>();
+	// 只允许为已确认的文件生成下载预签名URL
+	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
 
 	if (!record) {
 		return c.json({ error: 'File not found' }, 404);
