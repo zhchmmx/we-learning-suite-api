@@ -43,8 +43,9 @@ interface QuizSessionRecord {
 
 /**
  * POST /sessions
- * 创建 quiz session（需要用户 JWT）
- * 返回 ticket（给 AI Worker 用）+ 文档预签名下载 URL
+ * 创建 quiz session 并服务端触发 AI Worker（需要用户 JWT）
+ * 客户端只需提供 sourceFileId，拿到的响应只有 sessionId + 状态，
+ * ticket 和 downloadUrl 由服务端传给 AI Worker，客户端全程接触不到 AI Worker
  */
 quiz.post('/sessions', authMiddleware, async (c) => {
 	const userId = c.get('userId');
@@ -92,11 +93,32 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 		expiresIn: TICKET_TTL_SECONDS,
 	});
 
+	// 服务端触发 AI Worker（ticket + downloadUrl 只在服务端之间传递）
+	let triggerOk = false;
+	try {
+		const triggerRes = await fetch(`${c.env.AI_WORKER_URL}/api/quiz/generate`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ ticket: ticketId, downloadUrls: [downloadUrl] }),
+			signal: AbortSignal.timeout(15000),
+		});
+		triggerOk = triggerRes.ok;
+	} catch {
+		// 网络错误 / 超时
+		triggerOk = false;
+	}
+
+	if (!triggerOk) {
+		// 触发失败：清理刚创建的 session，不留垃圾数据
+		await c.env.DB.prepare(`DELETE FROM quiz_sessions WHERE id = ?`).bind(ticketId).run();
+		return c.json({ error: 'AI 服务暂时不可用，请稍后重试' }, 503);
+	}
+
 	return c.json({
 		data: {
-			ticket: ticketId,
-			downloadUrl,
+			sessionId: ticketId,
 			sourceFileName: file.name,
+			status: 'processing',
 			expiresIn: TICKET_TTL_SECONDS,
 		},
 	}, 201);

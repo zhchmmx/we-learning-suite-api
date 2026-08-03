@@ -23,6 +23,7 @@ npm install
 
 - `APPWRITE_ENDPOINT`: 你的 Appwrite endpoint（如 `https://cloud.appwrite.io/v1`）
 - `APPWRITE_PROJECT_ID`: 你的 Appwrite 项目 ID
+- `AI_WORKER_URL`: AI Worker（we-learning-suite-ai）的部署地址，用于服务端触发出题
 - D1 的 `database_id`: 在 Cloudflare 控制台 → D1 → 你的数据库 → Settings 中获取
 
 ### 3. 设置 Secrets
@@ -358,24 +359,29 @@ We Quiz 模块管理结构化题目、作答记录和艾宾浩斯复习调度。
 We Quiz 有两种认证方式：
 
 - **用户 JWT**：桌面客户端使用，`Authorization: Bearer <jwt>`
-- **Ticket**：AI Worker 使用，`X-Quiz-Ticket: <ticket>`（通过创建 session 获取）
+- **Ticket**：AI Worker 使用，`X-Quiz-Ticket: <ticket>`（服务端创建 session 时生成并直接传给 AI Worker，客户端不可见）
 
 ---
 
 ### AI 转换完整链路
 
+客户端全程只与本 API 通信，接触不到 AI Worker（ticket 和 downloadUrl 只在服务端之间传递）：
+
 ```
-① 客户端 → POST /api/quiz/sessions (JWT)     → 获得 ticket + downloadUrl
-② 客户端 → 将 ticket + downloadUrl 传给 AI Worker
-③ AI Worker → GET downloadUrl                  → 下载源文档
-④ AI Worker → 调用 AI 服务                     → 获得结构化题目
-⑤ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing
-⑥ AI Worker → POST /api/quiz/questions/batch (ticket)      → 上传题目
+① 客户端 → POST /api/quiz/sessions (JWT)     → 获得 sessionId
+② 本 API  → POST AI_WORKER_URL/api/quiz/generate → 传 { ticket, downloadUrls[] }（服务端触发）
+③ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing
+④ AI Worker → GET downloadUrl                  → 下载源文档
+⑤ AI Worker → 调用 AI 服务（图片先 OCR 转文字）  → 获得结构化题目
+⑥ AI Worker → POST /api/quiz/questions/batch (ticket)      → 上传题目，session 自动标记 completed
+⑦ 客户端 → GET /api/quiz/sessions/:id 轮询状态 → completed 后拉取题目
 ```
 
 ---
 
 ### 创建 Quiz Session
+
+创建 session 的同时，服务端会直接触发 AI Worker 开始出题。客户端不需要（也无法）接触 AI Worker。
 
 ```
 POST /api/quiz/sessions
@@ -398,15 +404,17 @@ curl -X POST https://your-worker.workers.dev/api/quiz/sessions \
 ```json
 {
   "data": {
-    "ticket": "a1b2c3d4-...",
-    "downloadUrl": "https://xxx.r2.cloudflarestorage.com/...",
-    "sourceFileName": "math-chapter3.pdf",
+    "sessionId": "a1b2c3d4-...",
+    "sourceFileName": "math-chapter3.txt",
+    "status": "processing",
     "expiresIn": 1800
   }
 }
 ```
 
-ticket 有效期 30 分钟，只能用于该 session 对应的操作。
+- 响应不再包含 ticket / downloadUrl（它们是服务端内部凭证）
+- 若 AI Worker 触发失败，session 会被自动清理并返回 503 `AI 服务暂时不可用，请稍后重试`
+- session 有效期 30 分钟，用 `sessionId` 通过下方"查询 Session 状态"接口轮询进度
 
 ---
 
@@ -652,9 +660,9 @@ Content-Type: application/json
 
 ## We Quiz 桌面客户端集成要点
 
-1. 触发 AI 转换前，先调 `POST /api/quiz/sessions` 获取 ticket + downloadUrl
-2. 将 ticket 和 downloadUrl 传给 AI Worker，由 AI Worker 完成下载→转换→上传
-3. 可通过 `GET /api/quiz/sessions/:id` 轮询转换进度
+1. 出题只需调 `POST /api/quiz/sessions`（传 sourceFileId），服务端会自动触发 AI Worker，响应只含 sessionId
+2. 通过 `GET /api/quiz/sessions/:id` 轮询转换进度，completed 后题目即可查询
+3. 客户端不需要知道 AI Worker 的存在，ticket / downloadUrl 均为服务端内部凭证
 4. 刷题时调 `GET /api/quiz/questions?due=true&limit=N` 拉取到期题目
 5. 离线时本地缓存题目和调度状态，联网后通过 `POST /api/quiz/answers` 批量同步
 6. 调度算法（SM-2/FSRS）完全在客户端实现，服务端只存状态

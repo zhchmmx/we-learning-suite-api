@@ -10,6 +10,7 @@ export interface AppEnv {
 		DB: D1Database;
 		APPWRITE_ENDPOINT: string;
 		APPWRITE_PROJECT_ID: string;
+		AI_WORKER_URL: string;
 		// 以下通过 wrangler secret put 设置
 		R2_ACCESS_KEY_ID: string;
 		R2_SECRET_ACCESS_KEY: string;
