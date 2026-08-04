@@ -2,12 +2,10 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { authMiddleware } from '../auth';
 import { ticketAuthMiddleware } from '../middleware/ticket-auth';
-import { generatePresignedUrl } from '../services/presign';
 import { isAllowedUploadMime } from './files';
 
 const quiz = new Hono<AppEnv>();
 
-const BUCKET_NAME = 'we-learning-suite';
 const TICKET_TTL_SECONDS = 1800; // 30 分钟
 const MAX_BATCH_SIZE = 500;
 
@@ -90,24 +88,16 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 		.bind(ticketId, userId, body.sourceFileId, expiresAt.toISOString(), now.toISOString())
 		.run();
 
-	// 生成文档预签名下载 URL
-	const downloadUrl = await generatePresignedUrl({
-		accountId: c.env.CLOUDFLARE_ACCOUNT_ID,
-		accessKeyId: c.env.R2_ACCESS_KEY_ID,
-		secretAccessKey: c.env.R2_SECRET_ACCESS_KEY,
-		bucket: BUCKET_NAME,
-		key: file.r2_key,
-		method: 'GET',
-		expiresIn: TICKET_TTL_SECONDS,
-	});
-
-	// 服务端触发 AI Worker（Service Binding 内部直连，ticket + downloadUrl 不走公网）
+	// 服务端触发 AI Worker（Service Binding 内部直连，直接传 R2 key，不走预签名 URL）
 	let triggerOk = false;
 	try {
 		const triggerRes = await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/quiz/generate', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ ticket: ticketId, downloadUrls: [downloadUrl] }),
+			body: JSON.stringify({
+				ticket: ticketId,
+				materials: [{ r2Key: file.r2_key, mimeType: file.mime_type }],
+			}),
 			signal: AbortSignal.timeout(15000),
 		});
 		triggerOk = triggerRes.ok;
