@@ -6,6 +6,23 @@ const files = new Hono<AppEnv>();
 
 const BUCKET_NAME = 'we-learning-suite';
 
+// ===== 上传格式白名单 =====
+
+/**
+ * 服务器只接受文本格式文件。
+ * PDF / Office / 图片等由客户端在上传前转成文本（扫描件与图片走 OCR），
+ * 保证 R2 里存的、出题管线吃的都只能是文本。
+ */
+const ALLOWED_UPLOAD_MIME_TYPES = new Set(['text/plain', 'text/markdown', 'text/x-markdown']);
+
+/** 校验 MIME 是否为允许的文本格式（容忍 "text/plain; charset=utf-8" 这类带参数的写法） */
+export function isAllowedUploadMime(mimeType: string): boolean {
+	return ALLOWED_UPLOAD_MIME_TYPES.has(mimeType.toLowerCase().split(';')[0].trim());
+}
+
+const UPLOAD_FORMAT_ERROR =
+	'服务器只接受文本格式（txt / markdown）。PDF、Office、图片等请先在客户端转换为文本后再上传';
+
 // ===== 工具函数 =====
 
 function toResponse(record: FileRecord): FileMetadataResponse {
@@ -93,6 +110,11 @@ files.post('/upload', async (c) => {
 	// 验证文件名
 	if (!isValidFileName(fileName)) {
 		return c.json({ error: 'Invalid file name. Cannot contain /\\:*?"<>| and must be 1-255 characters.' }, 400);
+	}
+
+	// 只接受文本格式（其余格式请先在客户端转成文本）
+	if (!isAllowedUploadMime(mimeType)) {
+		return c.json({ error: UPLOAD_FORMAT_ERROR }, 415);
 	}
 
 	// 生成文件 ID 和 R2 key
@@ -445,6 +467,12 @@ files.post('/presign/upload', async (c) => {
 
 	const targetPath = normalizePath(body.path || '/');
 	const mimeType = body.mimeType || 'application/octet-stream';
+
+	// 预签名上传同样只接受文本格式
+	if (!isAllowedUploadMime(mimeType)) {
+		return c.json({ error: UPLOAD_FORMAT_ERROR }, 415);
+	}
+
 	const fileId = crypto.randomUUID();
 	const r2Key = generateR2Key(userId, targetPath, fileId);
 

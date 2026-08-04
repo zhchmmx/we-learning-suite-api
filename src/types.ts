@@ -15,6 +15,8 @@ export interface AppEnv {
 		R2_ACCESS_KEY_ID: string;
 		R2_SECRET_ACCESS_KEY: string;
 		CLOUDFLARE_ACCOUNT_ID: string;
+		// 与 we-learning-suite-ai 的 AI_INTERNAL_TOKEN 保持同值（两个 Worker 各自 secret put）
+		AI_INTERNAL_TOKEN: string;
 	};
 	Variables: {
 		userId: string;

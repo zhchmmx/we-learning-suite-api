@@ -3,6 +3,7 @@ import type { AppEnv } from '../types';
 import { authMiddleware } from '../auth';
 import { ticketAuthMiddleware } from '../middleware/ticket-auth';
 import { generatePresignedUrl } from '../services/presign';
+import { isAllowedUploadMime } from './files';
 
 const quiz = new Hono<AppEnv>();
 
@@ -64,10 +65,17 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 	// 验证文件存在且属于该用户
 	const file = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ?`)
 		.bind(body.sourceFileId, userId)
-		.first<{ id: string; r2_key: string; name: string }>();
+		.first<{ id: string; r2_key: string; name: string; mime_type: string }>();
 
 	if (!file) {
 		return c.json({ error: 'Source file not found' }, 404);
+	}
+
+	// 只允许对文本格式的文档出题（服务器只接受文本上传，历史遗留的 PDF 等无法生成）
+	if (!isAllowedUploadMime(file.mime_type)) {
+		return c.json({
+			error: '该文档不是文本格式，无法生成题目。请将其转换为文本（txt/md）后重新上传',
+		}, 415);
 	}
 
 	// 生成 ticket
@@ -185,6 +193,47 @@ quiz.patch('/sessions/:id/status', ticketAuthMiddleware, async (c) => {
 		.run();
 
 	return c.json({ data: { id: sessionId, status: body.status } });
+});
+
+// ===== OCR 路由 =====
+
+/**
+ * POST /ocr
+ * 图片转文字（需要用户 JWT）。
+ * 客户端上传前把扫描件 PDF 的渲染图 / 图片文件发到这里，
+ * 本 Worker 流式转发给 AI Worker 的 /api/ocr（携带内部令牌），再把结果原样流回。
+ * 客户端全程只与本 API 通信，看不到 AI Worker 的地址和令牌。
+ *
+ * Body: { images: [{ data: base64, mimeType: "image/jpeg"|"image/png"|"image/webp" }] }（最多 15 张）
+ * 返回：{ data: { text } }
+ */
+quiz.post('/ocr', authMiddleware, async (c) => {
+	const body = c.req.raw.body;
+	if (!body) {
+		return c.json({ error: 'Empty request body' }, 400);
+	}
+
+	let res: Response;
+	try {
+		res = await fetch(`${c.env.AI_WORKER_URL}/api/ocr`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Internal-Token': c.env.AI_INTERNAL_TOKEN,
+			},
+			body,
+			// OCR 是同步等待模型转录，多图时可能耗时几分钟（Worker 请求无墙钟限制）
+			signal: AbortSignal.timeout(5 * 60 * 1000),
+		});
+	} catch {
+		return c.json({ error: 'OCR 服务暂时不可用，请稍后重试' }, 502);
+	}
+
+	// AI Worker 返回的都是 JSON（成功或错误），状态码原样透传
+	return new Response(res.body, {
+		status: res.status,
+		headers: { 'Content-Type': 'application/json' },
+	});
 });
 
 // ===== Questions 路由 =====

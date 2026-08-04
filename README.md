@@ -32,6 +32,8 @@ npm install
 npx wrangler secret put R2_ACCESS_KEY_ID
 npx wrangler secret put R2_SECRET_ACCESS_KEY
 npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
+# OCR 代理用的内部共享密钥：与 we-learning-suite-ai 的 AI_INTERNAL_TOKEN 保持同值
+npx wrangler secret put AI_INTERNAL_TOKEN
 ```
 
 R2 API Token 在 Cloudflare 控制台 → R2 → Manage R2 API Tokens 中创建（需要 Object Read & Write 权限）。
