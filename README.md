@@ -91,20 +91,22 @@ GET /health
 POST /api/files/upload
 ```
 
+**服务器只接受文本格式**（`text/plain`、`text/markdown`），其他 MIME 类型一律返回 415。PDF / Office / 图片由客户端在上传前转成文本（扫描件与图片经 `POST /api/quiz/ocr` 识别）。
+
 支持两种方式：
 
 #### 方式一：multipart/form-data
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| file | File | 是 | 文件内容 |
+| file | File | 是 | 文件内容（文本格式） |
 | path | string | 否 | 目标目录，默认 `/` |
 | name | string | 否 | 自定义文件名，默认使用原始名 |
 
 ```bash
 curl -X POST https://your-worker.workers.dev/api/files/upload \
   -H "Authorization: Bearer <jwt>" \
-  -F "file=@homework.pdf" \
+  -F "file=@notes.txt" \
   -F "path=/math/"
 ```
 
@@ -116,15 +118,15 @@ curl -X POST https://your-worker.workers.dev/api/files/upload \
 |--------|------|------|
 | X-File-Name | 是 | 文件名 |
 | X-File-Path | 否 | 目标目录，默认 `/` |
-| Content-Type | 否 | MIME 类型 |
+| Content-Type | 否 | MIME 类型（必须是文本格式） |
 
 ```bash
 curl -X POST https://your-worker.workers.dev/api/files/upload \
   -H "Authorization: Bearer <jwt>" \
-  -H "X-File-Name: homework.pdf" \
+  -H "X-File-Name: notes.txt" \
   -H "X-File-Path: /math/" \
-  -H "Content-Type: application/pdf" \
-  --data-binary @homework.pdf
+  -H "Content-Type: text/plain" \
+  --data-binary @notes.txt
 ```
 
 **响应 (201)：**
@@ -132,14 +134,19 @@ curl -X POST https://your-worker.workers.dev/api/files/upload \
 {
   "data": {
     "id": "a1b2c3d4-...",
-    "name": "homework.pdf",
+    "name": "notes.txt",
     "path": "/math/",
     "size": 102400,
-    "mimeType": "application/pdf",
+    "mimeType": "text/plain",
     "createdAt": "2026-08-02T10:00:00.000Z",
     "updatedAt": "2026-08-02T10:00:00.000Z"
   }
 }
+```
+
+**格式错误 (415)：**
+```json
+{ "error": "服务器只接受文本格式（txt / markdown）。PDF、Office、图片等请先在客户端转换为文本后再上传" }
 ```
 
 ---
@@ -367,17 +374,46 @@ We Quiz 有两种认证方式：
 
 ### AI 转换完整链路
 
-客户端全程只与本 API 通信，接触不到 AI Worker（ticket 和 downloadUrl 只在服务端之间传递）：
+客户端全程只与本 API 通信，接触不到 AI Worker（ticket、downloadUrl、内部令牌只在服务端之间传递）。**服务器只存文本**：PDF / 图片在上传前就由客户端转成文本。
 
 ```
-① 客户端 → POST /api/quiz/sessions (JWT)     → 获得 sessionId
-② 本 API  → POST AI_WORKER_URL/api/quiz/generate → 传 { ticket, downloadUrls[] }（服务端触发）
-③ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing
-④ AI Worker → GET downloadUrl                  → 下载源文档
-⑤ AI Worker → 调用 AI 服务（图片先 OCR 转文字）  → 获得结构化题目
-⑥ AI Worker → POST /api/quiz/questions/batch (ticket)      → 上传题目，session 自动标记 completed
-⑦ 客户端 → GET /api/quiz/sessions/:id 轮询状态 → completed 后拉取题目
+① 客户端本地转码：txt/md 直接通过；带文字层的 PDF 抽取文字；
+                 扫描件 PDF 逐页渲染成 PNG、图片文件 → 走 ② 识别
+② 客户端 → POST /api/quiz/ocr (JWT, 图片 base64) → 本 API 流式转发给 AI Worker → 返回转录文字
+③ 客户端 → 上传文本（POST /api/files/upload，只接受 txt/md）→ 拿到 fileId
+④ 客户端 → POST /api/quiz/sessions (JWT)        → 获得 sessionId
+⑤ 本 API  → POST AI_WORKER_URL/api/quiz/generate → 传 { ticket, downloadUrls[] }（服务端触发）
+⑥ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing
+⑦ AI Worker → GET downloadUrl                    → 下载文本文档
+⑧ AI Worker → 调用生成模型                       → 获得结构化题目
+⑨ AI Worker → POST /api/quiz/questions/batch (ticket)      → 上传题目，session 自动标记 completed
+⑩ 客户端 → GET /api/quiz/sessions/:id 轮询状态 → completed 后拉取题目
 ```
+
+历史遗留的非文本文件（如旧上传的 PDF）仍保存在文件库，但无法发起出题（`POST /api/quiz/sessions` 会返回 415），需要转成文本重新上传。
+
+---
+
+### 图片转文字（OCR）
+
+```
+POST /api/quiz/ocr
+Authorization: Bearer <jwt>
+Content-Type: application/json
+```
+
+客户端上传前的转码接口：把扫描件 PDF 的渲染图 / 图片文件转成文字。本接口把请求流式转发给 AI Worker（携带内部令牌 `AI_INTERNAL_TOKEN`），客户端依然接触不到 AI Worker。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| images | array | 是 | 1~15 项，每项 `{ data: base64, mimeType: image/jpeg/image/png/image/webp }`，单张 ≤4MB |
+
+**响应 (200)：**
+```json
+{ "data": { "text": "转录出来的文字" } }
+```
+
+**错误：** 400 参数错误 / 422 图片中无可识别文字 / 502 AI 服务不可用。多图时每 5 张一次模型调用，整体可能耗时几分钟，客户端请放宽超时。
 
 ---
 
@@ -415,6 +451,7 @@ curl -X POST https://your-worker.workers.dev/api/quiz/sessions \
 ```
 
 - 响应不再包含 ticket / downloadUrl（它们是服务端内部凭证）
+- 源文档必须是文本格式（历史遗留的 PDF 等会返回 415，提示转换后重新上传）
 - 若 AI Worker 触发失败，session 会被自动清理并返回 503 `AI 服务暂时不可用，请稍后重试`
 - session 有效期 30 分钟，用 `sessionId` 通过下方"查询 Session 状态"接口轮询进度
 
@@ -662,9 +699,10 @@ Content-Type: application/json
 
 ## We Quiz 桌面客户端集成要点
 
-1. 出题只需调 `POST /api/quiz/sessions`（传 sourceFileId），服务端会自动触发 AI Worker，响应只含 sessionId
-2. 通过 `GET /api/quiz/sessions/:id` 轮询转换进度，completed 后题目即可查询
-3. 客户端不需要知道 AI Worker 的存在，ticket / downloadUrl 均为服务端内部凭证
-4. 刷题时调 `GET /api/quiz/questions?due=true&limit=N` 拉取到期题目
-5. 离线时本地缓存题目和调度状态，联网后通过 `POST /api/quiz/answers` 批量同步
-6. 调度算法（SM-2/FSRS）完全在客户端实现，服务端只存状态
+1. 上传文档用 `Documents.UploadDocumentAsync`：txt/md 直传，带文字层的 PDF 自动抽取文字，扫描件 PDF 与图片自动走 `POST /api/quiz/ocr` 识别后以文本上传（服务器只接受文本）
+2. 出题只需调 `POST /api/quiz/sessions`（传 sourceFileId），服务端会自动触发 AI Worker，响应只含 sessionId
+3. 通过 `GET /api/quiz/sessions/:id` 轮询转换进度，completed 后题目即可查询
+4. 客户端不需要知道 AI Worker 的存在，ticket / downloadUrl / 内部令牌均为服务端内部凭证
+5. 刷题时调 `GET /api/quiz/questions?due=true&limit=N` 拉取到期题目
+6. 离线时本地缓存题目和调度状态，联网后通过 `POST /api/quiz/answers` 批量同步
+7. 调度算法（SM-2/FSRS）完全在客户端实现，服务端只存状态
