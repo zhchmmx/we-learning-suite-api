@@ -101,10 +101,10 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 		expiresIn: TICKET_TTL_SECONDS,
 	});
 
-	// 服务端触发 AI Worker（ticket + downloadUrl 只在服务端之间传递）
+	// 服务端触发 AI Worker（Service Binding 内部直连，ticket + downloadUrl 不走公网）
 	let triggerOk = false;
 	try {
-		const triggerRes = await fetch(`${c.env.AI_WORKER_URL}/api/quiz/generate`, {
+		const triggerRes = await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/quiz/generate', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ ticket: ticketId, downloadUrls: [downloadUrl] }),
@@ -201,8 +201,8 @@ quiz.patch('/sessions/:id/status', ticketAuthMiddleware, async (c) => {
  * POST /ocr
  * 图片转文字（需要用户 JWT）。
  * 客户端上传前把扫描件 PDF 的渲染图 / 图片文件发到这里，
- * 本 Worker 流式转发给 AI Worker 的 /api/ocr（携带内部令牌），再把结果原样流回。
- * 客户端全程只与本 API 通信，看不到 AI Worker 的地址和令牌。
+ * 本 Worker 通过 Service Binding 内部直连 AI Worker 的 /api/ocr，再把结果原样流回。
+ * AI Worker 没有公网入口，客户端（以及任何外部请求）物理上接触不到它。
  *
  * Body: { images: [{ data: base64, mimeType: "image/jpeg"|"image/png"|"image/webp" }] }（最多 15 张）
  * 返回：{ data: { text } }
@@ -215,12 +215,9 @@ quiz.post('/ocr', authMiddleware, async (c) => {
 
 	let res: Response;
 	try {
-		res = await fetch(`${c.env.AI_WORKER_URL}/api/ocr`, {
+		res = await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/ocr', {
 			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'X-Internal-Token': c.env.AI_INTERNAL_TOKEN,
-			},
+			headers: { 'Content-Type': 'application/json' },
 			body,
 			// OCR 是同步等待模型转录，多图时可能耗时几分钟（Worker 请求无墙钟限制）
 			signal: AbortSignal.timeout(5 * 60 * 1000),

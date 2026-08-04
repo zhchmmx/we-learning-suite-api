@@ -10,13 +10,12 @@ export interface AppEnv {
 		DB: D1Database;
 		APPWRITE_ENDPOINT: string;
 		APPWRITE_PROJECT_ID: string;
-		AI_WORKER_URL: string;
+		// Service Binding：内部直连出题 AI Worker（不走公网，无需 URL 和令牌）
+		AI_WORKER: Fetcher;
 		// 以下通过 wrangler secret put 设置
 		R2_ACCESS_KEY_ID: string;
 		R2_SECRET_ACCESS_KEY: string;
 		CLOUDFLARE_ACCOUNT_ID: string;
-		// 与 we-learning-suite-ai 的 AI_INTERNAL_TOKEN 保持同值（两个 Worker 各自 secret put）
-		AI_INTERNAL_TOKEN: string;
 	};
 	Variables: {
 		userId: string;

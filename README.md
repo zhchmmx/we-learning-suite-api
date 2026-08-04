@@ -23,7 +23,7 @@ npm install
 
 - `APPWRITE_ENDPOINT`: 你的 Appwrite endpoint（如 `https://cloud.appwrite.io/v1`）
 - `APPWRITE_PROJECT_ID`: 你的 Appwrite 项目 ID
-- `AI_WORKER_URL`: AI Worker（we-learning-suite-ai）的部署地址，用于服务端触发出题
+- Service Binding `AI_WORKER`: 指向出题 AI Worker（we-learning-suite-ai），内部直连，不走公网、无需配置地址
 - D1 的 `database_id`: 在 Cloudflare 控制台 → D1 → 你的数据库 → Settings 中获取
 
 ### 3. 设置 Secrets
@@ -32,8 +32,6 @@ npm install
 npx wrangler secret put R2_ACCESS_KEY_ID
 npx wrangler secret put R2_SECRET_ACCESS_KEY
 npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
-# OCR 代理用的内部共享密钥：与 we-learning-suite-ai 的 AI_INTERNAL_TOKEN 保持同值
-npx wrangler secret put AI_INTERNAL_TOKEN
 ```
 
 R2 API Token 在 Cloudflare 控制台 → R2 → Manage R2 API Tokens 中创建（需要 Object Read & Write 权限）。
@@ -49,6 +47,8 @@ npx wrangler d1 migrations apply we-learning-suite-db
 ```bash
 npx wrangler dev
 ```
+
+联调出题链路时，AI Worker 项目也要同时 `npx wrangler dev --port 8788`——Service Binding 会自动指向本地实例。
 
 ### 6. 部署
 
@@ -374,15 +374,15 @@ We Quiz 有两种认证方式：
 
 ### AI 转换完整链路
 
-客户端全程只与本 API 通信，接触不到 AI Worker（ticket、downloadUrl、内部令牌只在服务端之间传递）。**服务器只存文本**：PDF / 图片在上传前就由客户端转成文本。
+客户端全程只与本 API 通信，接触不到 AI Worker——AI Worker 没有公网入口，本 API 通过 Service Binding 内部直连它。**服务器只存文本**：PDF / 图片在上传前就由客户端转成文本。
 
 ```
 ① 客户端本地转码：txt/md 直接通过；带文字层的 PDF 抽取文字；
                  扫描件 PDF 逐页渲染成 PNG、图片文件 → 走 ② 识别
-② 客户端 → POST /api/quiz/ocr (JWT, 图片 base64) → 本 API 流式转发给 AI Worker → 返回转录文字
+② 客户端 → POST /api/quiz/ocr (JWT, 图片 base64) → 本 API 经 Service Binding 调 AI Worker → 返回转录文字
 ③ 客户端 → 上传文本（POST /api/files/upload，只接受 txt/md）→ 拿到 fileId
 ④ 客户端 → POST /api/quiz/sessions (JWT)        → 获得 sessionId
-⑤ 本 API  → POST AI_WORKER_URL/api/quiz/generate → 传 { ticket, downloadUrls[] }（服务端触发）
+⑤ 本 API  → Service Binding 调 AI Worker /api/quiz/generate → 传 { ticket, downloadUrls[] }（服务端触发）
 ⑥ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing
 ⑦ AI Worker → GET downloadUrl                    → 下载文本文档
 ⑧ AI Worker → 调用生成模型                       → 获得结构化题目
@@ -402,7 +402,7 @@ Authorization: Bearer <jwt>
 Content-Type: application/json
 ```
 
-客户端上传前的转码接口：把扫描件 PDF 的渲染图 / 图片文件转成文字。本接口把请求流式转发给 AI Worker（携带内部令牌 `AI_INTERNAL_TOKEN`），客户端依然接触不到 AI Worker。
+客户端上传前的转码接口：把扫描件 PDF 的渲染图 / 图片文件转成文字。本接口通过 Service Binding 内部调用 AI Worker（AI Worker 无公网入口），客户端依然接触不到它。
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
