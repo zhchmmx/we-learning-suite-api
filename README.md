@@ -361,7 +361,7 @@ POST /api/files/presign/download/:id
 
 ## We Quiz API
 
-We Quiz 模块管理结构化题目、作答记录和艾宾浩斯复习调度。
+We Quiz 模块管理结构化题目、作答记录和艾宾浩斯复习调度，以 **Quiz** 为聚合根（Document 1:1 Quiz，Quiz 1:N Questions）。
 
 ### 认证方式
 
@@ -369,6 +369,22 @@ We Quiz 有两种认证方式：
 
 - **用户 JWT**：桌面客户端使用，`Authorization: Bearer <jwt>`
 - **Ticket**：AI Worker 使用，`X-Quiz-Ticket: <ticket>`（服务端创建 session 时生成并直接传给 AI Worker，客户端不可见）
+
+---
+
+### 数据模型
+
+```
+Document (files 表) ──1:1── Quiz (quizzes 表) ──1:N── Questions (questions 表)
+                                                            │
+                                                    1:N ───┘
+                                                            │
+                                                    AnswerRecords
+```
+
+- **Quiz**：一次出题的持久化结果。创建 session 时同步创建，status 随 AI Worker 回调自动流转（`generating` → `completed` / `failed`）
+- **问题**：每道题关联到一个 Quiz，自带 SM-2 调度字段，客户端通过 `quizId` 拉取指定 Quiz 下的题目
+- **已掌握**：SM-2 间隔 ≥ 21 天视为已掌握，Quiz 列表展示掌握进度
 
 ---
 
@@ -381,16 +397,98 @@ We Quiz 有两种认证方式：
                  扫描件 PDF 逐页渲染成 PNG、图片文件 → 走 ② 识别
 ② 客户端 → POST /api/quiz/ocr (JWT, 图片 base64) → 本 API 经 Service Binding 调 AI Worker → 返回转录文字
 ③ 客户端 → 上传文本（POST /api/files/upload，只接受 txt/md）→ 拿到 fileId
-④ 客户端 → POST /api/quiz/sessions (JWT)        → 获得 sessionId
-⑤ 本 API  → Service Binding 调 AI Worker /api/quiz/generate → 传 { ticket, downloadUrls[] }（服务端触发）
-⑥ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing
-⑦ AI Worker → GET downloadUrl                    → 下载文本文档
+④ 客户端 → POST /api/quiz/sessions (JWT)        → 后台创建 Quiz + session，获得 quizId
+⑤ 本 API  → Service Binding 调 AI Worker /api/quiz/generate → 传 { ticket, materials: [{ r2Key, mimeType }] }
+⑥ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing，同步更新 quizzes
+⑦ AI Worker → 直接读 R2（r2Key）                 → 获取文本文档
 ⑧ AI Worker → 调用生成模型                       → 获得结构化题目
-⑨ AI Worker → POST /api/quiz/questions/batch (ticket)      → 上传题目，session 自动标记 completed
-⑩ 客户端 → GET /api/quiz/sessions/:id 轮询状态 → completed 后拉取题目
+⑨ AI Worker → POST /api/quiz/questions/batch (ticket) → 入库挂 quizId，quiz 自动标记 completed
+⑩ 客户端 → GET /api/quiz/sessions/:id 轮询状态 → completed 后通过 quizId 拉取题目
 ```
 
 历史遗留的非文本文件（如旧上传的 PDF）仍保存在文件库，但无法发起出题（`POST /api/quiz/sessions` 会返回 415），需要转成文本重新上传。
+
+---
+
+### Quiz 管理
+
+#### 获取 Quiz 列表
+
+```
+GET /api/quiz/quizzes
+Authorization: Bearer <jwt>
+```
+
+**响应：**
+```json
+{
+  "data": [
+    {
+      "id": "quiz-uuid",
+      "name": "math-chapter3.txt",
+      "sourceFileId": "file-uuid",
+      "sourceFileName": "math-chapter3.txt",
+      "totalQuestions": 25,
+      "masteredQuestions": 8,
+      "status": "completed",
+      "createdAt": "2026-08-02T10:00:00.000Z",
+      "updatedAt": "2026-08-02T10:01:30.000Z"
+    }
+  ]
+}
+```
+
+- `masteredQuestions`：SM-2 间隔 ≥ 21 天的题目数（已掌握）
+- status：`generating` / `completed` / `failed`
+
+#### 获取单个 Quiz 详情
+
+```
+GET /api/quiz/quizzes/:id
+Authorization: Bearer <jwt>
+```
+
+响应结构同上（单对象）。
+
+#### 重命名 Quiz
+
+```
+PATCH /api/quiz/quizzes/:id
+Authorization: Bearer <jwt>
+Content-Type: application/json
+```
+
+```json
+{ "name": "高等数学第三章" }
+```
+
+**响应：**
+```json
+{ "data": { "id": "quiz-uuid", "name": "高等数学第三章" } }
+```
+
+#### 删除 Quiz
+
+```
+DELETE /api/quiz/quizzes/:id
+Authorization: Bearer <jwt>
+```
+
+级联删除关联的所有题目、作答记录和会话。
+
+**响应：**
+```json
+{ "data": { "deleted": true, "id": "quiz-uuid" } }
+```
+
+#### 获取 Quiz 下的题目
+
+```
+GET /api/quiz/quizzes/:id/questions?due=true&type=single_choice&page=1&limit=20
+Authorization: Bearer <jwt>
+```
+
+查询参数同 `GET /api/quiz/questions`，但不需传 `quizId`（已由路径指定）。按 `next_review_at` 升序排列。
 
 ---
 
@@ -419,7 +517,7 @@ Content-Type: application/json
 
 ### 创建 Quiz Session
 
-创建 session 的同时，服务端会直接触发 AI Worker 开始出题。客户端不需要（也无法）接触 AI Worker。
+创建 session 的同时，服务端会同步创建 Quiz 实体（status=`generating`），并触发 AI Worker 开始出题。客户端不需要（也无法）接触 AI Worker。
 
 ```
 POST /api/quiz/sessions
@@ -442,18 +540,19 @@ curl -X POST https://your-worker.workers.dev/api/quiz/sessions \
 ```json
 {
   "data": {
+    "quizId": "a1b2c3d4-...",
     "sessionId": "a1b2c3d4-...",
     "sourceFileName": "math-chapter3.txt",
-    "status": "processing",
+    "status": "generating",
     "expiresIn": 1800
   }
 }
 ```
 
-- 响应不再包含 ticket / downloadUrl（它们是服务端内部凭证）
+- 同时创建 Quiz 和 session，两者 id 相同（quizId === sessionId）
 - 源文档必须是文本格式（历史遗留的 PDF 等会返回 415，提示转换后重新上传）
-- 若 AI Worker 触发失败，session 会被自动清理并返回 503 `AI 服务暂时不可用，请稍后重试`
-- session 有效期 30 分钟，用 `sessionId` 通过下方"查询 Session 状态"接口轮询进度
+- 若 AI Worker 触发失败，Quiz 和 session 会被自动清理并返回 503 `AI 服务暂时不可用，请稍后重试`
+- session 有效期 30 分钟，用 `quizId` 通过下方"查询 Session 状态"接口轮询进度
 
 ---
 
@@ -468,7 +567,8 @@ Authorization: Bearer <jwt>
 ```json
 {
   "data": {
-    "id": "a1b2c3d4-...",
+    "quizId": "a1b2c3d4-...",
+    "sessionId": "a1b2c3d4-...",
     "sourceFileId": "file-uuid",
     "status": "completed",
     "createdAt": "2026-08-02T10:00:00.000Z",
@@ -479,6 +579,7 @@ Authorization: Bearer <jwt>
 ```
 
 status 取值：`pending` → `processing` → `completed` / `failed`
+- session 过期清理后仍可通过 quizId 查到 Quiz 状态（响应不含 sessionId 和 expiresAt）
 
 ---
 
@@ -546,26 +647,25 @@ Content-Type: application/json
 {
   "data": {
     "inserted": 3,
-    "questionIds": ["uuid-1", "uuid-2", "uuid-3"],
-    "sessionId": "session-uuid"
+    "quizId": "session-uuid"
   }
 }
 ```
 
-上传成功后 session 状态自动变为 `completed`。
+上传成功后 Quiz 和 session 状态同时变为 `completed`。
 
 ---
 
 ### 获取题目列表
 
 ```
-GET /api/quiz/questions?due=true&page=1&limit=20
+GET /api/quiz/questions?quizId=xxx&due=true&page=1&limit=20
 Authorization: Bearer <jwt>
 ```
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| sourceFileId | string | - | 按来源文档过滤 |
+| quizId | string | - | 按 Quiz 过滤 |
 | tags | string | - | 逗号分隔标签（匹配任一） |
 | due | boolean | false | 只返回到期题目（next_review_at ≤ 当前时间） |
 | type | string | - | 按题型过滤 |
@@ -579,7 +679,7 @@ Authorization: Bearer <jwt>
     "questions": [
       {
         "id": "uuid-1",
-        "sourceFileId": "file-uuid",
+        "quizId": "quiz-uuid",
         "type": "single_choice",
         "content": { "stem": "2+2等于?", "options": ["3", "4", "5", "6"] },
         "answer": { "correctIndex": 1 },
@@ -602,7 +702,9 @@ Authorization: Bearer <jwt>
 }
 ```
 
-**离线刷题建议**：客户端联网时用 `?due=true&limit=20` 拉取一批到期题目缓存到本地，离线时本地出题，联网后同步作答结果。
+也可以使用 `GET /api/quiz/quizzes/:id/questions` 按指定 Quiz 拉取题目。
+
+**离线刷题建议**：客户端联网时用 `?quizId=xxx&due=true&limit=20` 拉取一批到期题目缓存到本地，离线时本地出题，联网后同步作答结果。
 
 ---
 
@@ -700,9 +802,10 @@ Content-Type: application/json
 ## We Quiz 桌面客户端集成要点
 
 1. 上传文档用 `Documents.UploadDocumentAsync`：txt/md 直传，带文字层的 PDF 自动抽取文字，扫描件 PDF 与图片自动走 `POST /api/quiz/ocr` 识别后以文本上传（服务器只接受文本）
-2. 出题只需调 `POST /api/quiz/sessions`（传 sourceFileId），服务端会自动触发 AI Worker，响应只含 sessionId
-3. 通过 `GET /api/quiz/sessions/:id` 轮询转换进度，completed 后题目即可查询
-4. 客户端不需要知道 AI Worker 的存在，ticket / downloadUrl / 内部令牌均为服务端内部凭证
-5. 刷题时调 `GET /api/quiz/questions?due=true&limit=N` 拉取到期题目
-6. 离线时本地缓存题目和调度状态，联网后通过 `POST /api/quiz/answers` 批量同步
-7. 调度算法（SM-2/FSRS）完全在客户端实现，服务端只存状态
+2. 出题只需调 `POST /api/quiz/sessions`（传 sourceFileId），服务端会自动创建 Quiz 并触发 AI Worker，响应含 quizId
+3. 通过 `GET /api/quiz/sessions/:id` 轮询转换进度，completed 后 Quiz 即就绪
+4. 客户端不需要知道 AI Worker 的存在，ticket / r2Key / 内部令牌均为服务端内部凭证
+5. 通过 `GET /api/quiz/quizzes` 查看所有 Quiz 及学习进度
+6. 刷题时调 `GET /api/quiz/quizzes/:id/questions?due=true&limit=N` 拉取指定 Quiz 的到期题目
+7. 离线时本地缓存题目和调度状态，联网后通过 `POST /api/quiz/answers` 批量同步
+8. 调度算法（SM-2/FSRS）完全在客户端实现，服务端只存状态

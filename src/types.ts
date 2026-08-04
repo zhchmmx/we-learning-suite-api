@@ -66,3 +66,27 @@ export interface PresignDownloadResponse {
 	downloadUrl: string;
 	expiresIn: number;
 }
+
+/** Quiz 实体：一次出题的持久化结果 */
+export interface QuizRecord {
+	id: string;
+	user_id: string;
+	source_file_id: string;
+	name: string;
+	status: 'generating' | 'completed' | 'failed';
+	created_at: string;
+	updated_at: string;
+}
+
+/** Quiz 列表响应项（聚合了文件信息和题目统计） */
+export interface QuizListItem {
+	id: string;
+	name: string;
+	sourceFileId: string;
+	sourceFileName: string;
+	totalQuestions: number;
+	masteredQuestions: number;
+	status: 'generating' | 'completed' | 'failed';
+	createdAt: string;
+	updatedAt: string;
+}
