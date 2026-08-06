@@ -44,6 +44,8 @@ export interface FileMetadataResponse {
 	size: number;
 	mimeType: string;
 	hasThumbnail: boolean;
+	/** 文档的 quiz 生成状态：none=从未出题，generating=生成中，completed=已成功生成，failed=生成失败 */
+	quizStatus: 'none' | 'generating' | 'completed' | 'failed';
 	createdAt: string;
 	updatedAt: string;
 }

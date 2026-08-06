@@ -25,7 +25,7 @@ const UPLOAD_FORMAT_ERROR =
 
 // ===== 工具函数 =====
 
-function toResponse(record: FileRecord): FileMetadataResponse {
+function toResponse(record: FileRecord & { quiz_status?: string | null }): FileMetadataResponse {
 	return {
 		id: record.id,
 		name: record.name,
@@ -33,6 +33,7 @@ function toResponse(record: FileRecord): FileMetadataResponse {
 		size: record.size,
 		mimeType: record.mime_type,
 		hasThumbnail: !!record.thumbnail_key,
+		quizStatus: (record.quiz_status as FileMetadataResponse['quizStatus']) ?? 'none',
 		createdAt: record.created_at,
 		updatedAt: record.updated_at,
 	};
@@ -180,18 +181,18 @@ files.get('/', async (c) => {
 	if (recursive) {
 		// 递归：列出该路径及所有子路径下的文件（只返回已确认的文件）
 		const pathPrefix = path === '/' ? '/' : path;
-		query = `SELECT * FROM files WHERE user_id = ? AND status = 'confirmed' AND (path = ? OR path LIKE ?) ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+		query = `SELECT f.*, q.status AS quiz_status FROM files f LEFT JOIN quizzes q ON q.source_file_id = f.id AND q.user_id = f.user_id WHERE f.user_id = ? AND f.status = 'confirmed' AND (f.path = ? OR f.path LIKE ?) ORDER BY f.created_at DESC LIMIT ? OFFSET ?`;
 		countQuery = `SELECT COUNT(*) as total FROM files WHERE user_id = ? AND status = 'confirmed' AND (path = ? OR path LIKE ?)`;
 		params.push(pathPrefix, `${pathPrefix}%`);
 	} else {
 		// 仅当前目录（只返回已确认的文件）
-		query = `SELECT * FROM files WHERE user_id = ? AND status = 'confirmed' AND path = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+		query = `SELECT f.*, q.status AS quiz_status FROM files f LEFT JOIN quizzes q ON q.source_file_id = f.id AND q.user_id = f.user_id WHERE f.user_id = ? AND f.status = 'confirmed' AND f.path = ? ORDER BY f.created_at DESC LIMIT ? OFFSET ?`;
 		countQuery = `SELECT COUNT(*) as total FROM files WHERE user_id = ? AND status = 'confirmed' AND path = ?`;
 		params.push(path);
 	}
 
 	const [filesResult, countResult] = await Promise.all([
-		c.env.DB.prepare(query).bind(...params, limit, offset).all<FileRecord>(),
+		c.env.DB.prepare(query).bind(...params, limit, offset).all<FileRecord & { quiz_status: string | null }>(),
 		c.env.DB.prepare(countQuery).bind(...params).first<{ total: number }>(),
 	]);
 
@@ -213,7 +214,12 @@ files.get('/:id', async (c) => {
 	const userId = c.get('userId');
 	const fileId = c.req.param('id');
 
-	const record = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
+	const record = await c.env.DB.prepare(
+		`SELECT f.*, q.status AS quiz_status
+		 FROM files f
+		 LEFT JOIN quizzes q ON q.source_file_id = f.id AND q.user_id = f.user_id
+		 WHERE f.id = ? AND f.user_id = ? AND f.status = 'confirmed'`
+	).bind(fileId, userId).first<FileRecord & { quiz_status: string | null }>();
 
 	if (!record) {
 		return c.json({ error: 'File not found' }, 404);
@@ -341,8 +347,13 @@ files.patch('/:id', async (c) => {
 		.bind(newName, newPath, r2Key, now, fileId, userId)
 		.run();
 
-	// 返回更新后的记录
-	const updated = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`).bind(fileId, userId).first<FileRecord>();
+	// 返回更新后的记录（LEFT JOIN quizzes 以保证 quizStatus 正确）
+	const updated = await c.env.DB.prepare(
+		`SELECT f.*, q.status AS quiz_status
+		 FROM files f
+		 LEFT JOIN quizzes q ON q.source_file_id = f.id AND q.user_id = f.user_id
+		 WHERE f.id = ? AND f.user_id = ? AND f.status = 'confirmed'`
+	).bind(fileId, userId).first<FileRecord & { quiz_status: string | null }>();
 
 	return c.json({ data: toResponse(updated!) });
 });
