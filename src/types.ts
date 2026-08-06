@@ -87,7 +87,7 @@ export interface QuizListItem {
 	sourceFileId: string;
 	sourceFileName: string;
 	totalQuestions: number;
-	masteredQuestions: number;
+	graduatedQuestions: number;
 	status: 'generating' | 'completed' | 'failed';
 	createdAt: string;
 	updatedAt: string;

@@ -19,11 +19,8 @@ interface QuestionRecord {
 	content: string;
 	answer: string;
 	tags: string | null;
-	ease_factor: number;
-	interval: number;
-	repetitions: number;
-	next_review_at: string;
-	last_reviewed_at: string | null;
+	consecutive_correct: number;
+	graduated: number;
 	created_at: string;
 	updated_at: string;
 }
@@ -41,8 +38,8 @@ interface QuizSessionRecord {
 
 // ===== 辅助函数 =====
 
-/** 计算已掌握题目数（SM-2 间隔 >= 21 天视为已掌握） */
-const MASTERED_INTERVAL_DAYS = 21;
+/** 连续答对达到此次数即毕业（固定，不可配置） */
+const GRADUATION_THRESHOLD = 3;
 
 function formatQuestion(q: QuestionRecord) {
 	return {
@@ -52,12 +49,9 @@ function formatQuestion(q: QuestionRecord) {
 		content: JSON.parse(q.content),
 		answer: JSON.parse(q.answer),
 		tags: q.tags ? JSON.parse(q.tags) : [],
-		schedule: {
-			easeFactor: q.ease_factor,
-			interval: q.interval,
-			repetitions: q.repetitions,
-			nextReviewAt: q.next_review_at,
-			lastReviewedAt: q.last_reviewed_at,
+		stats: {
+			consecutiveCorrect: q.consecutive_correct,
+			graduated: q.graduated,
 		},
 		createdAt: q.created_at,
 		updatedAt: q.updated_at,
@@ -78,7 +72,7 @@ quiz.get('/quizzes', authMiddleware, async (c) => {
 			q.id, q.name, q.source_file_id, q.status, q.created_at, q.updated_at,
 			f.name AS source_file_name,
 			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ?) AS total_questions,
-			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ? AND "interval" >= ${MASTERED_INTERVAL_DAYS}) AS mastered_questions
+			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ? AND graduated = 1) AS graduated_questions
 		FROM quizzes q
 		JOIN files f ON q.source_file_id = f.id
 		WHERE q.user_id = ?
@@ -91,7 +85,7 @@ quiz.get('/quizzes', authMiddleware, async (c) => {
 			source_file_id: string;
 			source_file_name: string;
 			total_questions: number;
-			mastered_questions: number;
+			graduated_questions: number;
 			status: string;
 			created_at: string;
 			updated_at: string;
@@ -103,7 +97,7 @@ quiz.get('/quizzes', authMiddleware, async (c) => {
 		sourceFileId: q.source_file_id as string,
 		sourceFileName: q.source_file_name as string,
 		totalQuestions: q.total_questions as number,
-		masteredQuestions: q.mastered_questions as number,
+		graduatedQuestions: q.graduated_questions as number,
 		status: q.status as 'generating' | 'completed' | 'failed',
 		createdAt: q.created_at as string,
 		updatedAt: q.updated_at as string,
@@ -124,7 +118,7 @@ quiz.get('/quizzes/:id', authMiddleware, async (c) => {
 		SELECT
 			q.*, f.name AS source_file_name,
 			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ?) AS total_questions,
-			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ? AND "interval" >= ${MASTERED_INTERVAL_DAYS}) AS mastered_questions
+			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ? AND graduated = 1) AS graduated_questions
 		FROM quizzes q
 		JOIN files f ON q.source_file_id = f.id
 		WHERE q.id = ? AND q.user_id = ?
@@ -143,7 +137,7 @@ quiz.get('/quizzes/:id', authMiddleware, async (c) => {
 			sourceFileId: q.source_file_id,
 			sourceFileName: q.source_file_name,
 			totalQuestions: q.total_questions,
-			masteredQuestions: q.mastered_questions,
+			graduatedQuestions: q.graduated_questions,
 			status: q.status,
 			createdAt: q.created_at,
 			updatedAt: q.updated_at,
@@ -219,7 +213,7 @@ quiz.delete('/quizzes/:id', authMiddleware, async (c) => {
  * 获取 Quiz 下的所有题目
  *
  * 查询参数：
- *   - due: "true" 只返回到期题目
+ *   - graduated: "true" 只返回已毕业，"false" 只返回未毕业，不传返回全部
  *   - type: 按题型过滤
  *   - page: 页码（默认 1）
  *   - limit: 每页数量（默认 50，最大 200）
@@ -237,7 +231,7 @@ quiz.get('/quizzes/:id/questions', authMiddleware, async (c) => {
 		return c.json({ error: 'Quiz not found' }, 404);
 	}
 
-	const due = c.req.query('due') === 'true';
+	const graduatedParam = c.req.query('graduated');
 	const type = c.req.query('type');
 	const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
 	const limit = Math.min(200, Math.max(1, parseInt(c.req.query('limit') || '50', 10)));
@@ -250,15 +244,16 @@ quiz.get('/quizzes/:id/questions', authMiddleware, async (c) => {
 		conditions.push('type = ?');
 		params.push(type);
 	}
-	if (due) {
-		conditions.push('next_review_at <= ?');
-		params.push(new Date().toISOString());
+	if (graduatedParam === 'true') {
+		conditions.push('graduated = 1');
+	} else if (graduatedParam === 'false') {
+		conditions.push('graduated = 0');
 	}
 
 	const whereClause = conditions.join(' AND ');
 
 	const [questionsResult, countResult] = await Promise.all([
-		c.env.DB.prepare(`SELECT * FROM questions WHERE ${whereClause} ORDER BY next_review_at ASC LIMIT ? OFFSET ?`)
+		c.env.DB.prepare(`SELECT * FROM questions WHERE ${whereClause} ORDER BY created_at ASC LIMIT ? OFFSET ?`)
 			.bind(...params, limit, offset)
 			.all<QuestionRecord>(),
 		c.env.DB.prepare(`SELECT COUNT(*) as total FROM questions WHERE ${whereClause}`)
@@ -531,15 +526,15 @@ quiz.post('/questions/batch', ticketAuthMiddleware, async (c) => {
 		}
 
 		return c.env.DB.prepare(
-			`INSERT INTO questions (id, user_id, quiz_id, type, content, answer, tags, ease_factor, interval, repetitions, next_review_at, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, 2.5, 0, 0, ?, ?, ?)`
+			`INSERT INTO questions (id, user_id, quiz_id, type, content, answer, tags, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		).bind(
 			id, userId, quizId,
 			q.type,
 			JSON.stringify(q.content),
 			JSON.stringify(q.answer),
 			q.tags ? JSON.stringify(q.tags) : null,
-			now, now, now,
+			now, now,
 		);
 	});
 
@@ -572,7 +567,7 @@ quiz.post('/questions/batch', ticketAuthMiddleware, async (c) => {
  * 查询参数：
  *   - quizId: 按 Quiz 过滤
  *   - tags: 逗号分隔的标签过滤
- *   - due: "true" 只返回到期题目
+ *   - graduated: "true" 只返回已毕业，"false" 只返回未毕业，不传返回全部
  *   - type: 按题型过滤
  *   - page / limit: 分页
  */
@@ -580,7 +575,7 @@ quiz.get('/questions', authMiddleware, async (c) => {
 	const userId = c.get('userId');
 	const quizId = c.req.query('quizId');
 	const tagsParam = c.req.query('tags');
-	const due = c.req.query('due') === 'true';
+	const graduatedParam = c.req.query('graduated');
 	const type = c.req.query('type');
 	const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
 	const limit = Math.min(200, Math.max(1, parseInt(c.req.query('limit') || '50', 10)));
@@ -599,9 +594,10 @@ quiz.get('/questions', authMiddleware, async (c) => {
 		params.push(type);
 	}
 
-	if (due) {
-		conditions.push('next_review_at <= ?');
-		params.push(new Date().toISOString());
+	if (graduatedParam === 'true') {
+		conditions.push('graduated = 1');
+	} else if (graduatedParam === 'false') {
+		conditions.push('graduated = 0');
 	}
 
 	if (tagsParam) {
@@ -616,7 +612,7 @@ quiz.get('/questions', authMiddleware, async (c) => {
 	const whereClause = conditions.join(' AND ');
 
 	const [questionsResult, countResult] = await Promise.all([
-		c.env.DB.prepare(`SELECT * FROM questions WHERE ${whereClause} ORDER BY next_review_at ASC LIMIT ? OFFSET ?`)
+		c.env.DB.prepare(`SELECT * FROM questions WHERE ${whereClause} ORDER BY created_at ASC LIMIT ? OFFSET ?`)
 			.bind(...params, limit, offset)
 			.all<QuestionRecord>(),
 		c.env.DB.prepare(`SELECT COUNT(*) as total FROM questions WHERE ${whereClause}`)
@@ -683,7 +679,10 @@ quiz.delete('/questions/:id', authMiddleware, async (c) => {
 
 /**
  * POST /answers
- * 批量提交作答记录 + 更新调度状态（需要用户 JWT）
+ * 批量提交作答记录 + 服务端算毕业（需要用户 JWT）
+ *
+ * 入参：{ answers: [{ questionId, isCorrect, userAnswer? }] }
+ * 服务端对每题：答对 consecutive_correct+1，答错归 0；满 GRADUATION_THRESHOLD 次标记 graduated=1（终态）。
  */
 quiz.post('/answers', authMiddleware, async (c) => {
 	const userId = c.get('userId');
@@ -693,12 +692,6 @@ quiz.post('/answers', authMiddleware, async (c) => {
 			questionId: string;
 			isCorrect: boolean;
 			userAnswer?: unknown;
-			newSchedule: {
-				easeFactor: number;
-				interval: number;
-				repetitions: number;
-				nextReviewAt: string;
-			};
 		}>;
 	};
 
@@ -720,32 +713,35 @@ quiz.post('/answers', authMiddleware, async (c) => {
 	const statements: ReturnType<typeof c.env.DB.prepare>[] = [];
 
 	for (const a of body.answers) {
-		if (!a.questionId || typeof a.isCorrect !== 'boolean' || !a.newSchedule) {
+		if (!a.questionId || typeof a.isCorrect !== 'boolean') {
 			continue;
 		}
 
 		const answerId = crypto.randomUUID();
+		const isCorrectInt = a.isCorrect ? 1 : 0;
 
+		// 1. 审计记录
 		statements.push(
 			c.env.DB.prepare(
 				`INSERT INTO answer_records (id, user_id, question_id, is_correct, user_answer, answered_at)
 				 VALUES (?, ?, ?, ?, ?, ?)`
-			).bind(answerId, userId, a.questionId, a.isCorrect ? 1 : 0, a.userAnswer ? JSON.stringify(a.userAnswer) : null, now)
+			).bind(answerId, userId, a.questionId, isCorrectInt, a.userAnswer ? JSON.stringify(a.userAnswer) : null, now)
 		);
 
+		// 2. 原子更新：答对+1/答错归0；满阈值标记毕业（终态，已毕业不再降）
 		statements.push(
 			c.env.DB.prepare(
 				`UPDATE questions
-				 SET ease_factor = ?, interval = ?, repetitions = ?, next_review_at = ?, last_reviewed_at = ?, updated_at = ?
+				 SET
+				   consecutive_correct = CASE WHEN ? THEN consecutive_correct + 1 ELSE 0 END,
+				   graduated = CASE
+				     WHEN graduated = 1 THEN 1
+				     WHEN (CASE WHEN ? THEN consecutive_correct + 1 ELSE 0 END) >= ? THEN 1
+				     ELSE 0
+				   END,
+				   updated_at = ?
 				 WHERE id = ? AND user_id = ?`
-			).bind(
-				a.newSchedule.easeFactor,
-				a.newSchedule.interval,
-				a.newSchedule.repetitions,
-				a.newSchedule.nextReviewAt,
-				now, now,
-				a.questionId, userId,
-			)
+			).bind(isCorrectInt, isCorrectInt, GRADUATION_THRESHOLD, now, a.questionId, userId)
 		);
 	}
 
