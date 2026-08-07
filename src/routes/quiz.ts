@@ -570,6 +570,39 @@ quiz.post('/sessions/:id/renew', ticketAuthMiddleware, async (c) => {
 	return c.json({ data: { sessionId, expiresAt: expiresAt.toISOString() } });
 });
 
+/**
+ * POST /sessions/:id/cancel
+ * 用户取消正在进行的出题任务（需要用户 JWT）。
+ * 将 session 和 quiz 状态置为 failed，AI Worker 下次续期 ticket 时会收到 4xx 从而中止。
+ */
+quiz.post('/sessions/:id/cancel', authMiddleware, async (c) => {
+	const userId = c.get('userId');
+	const sessionId = c.req.param('id');
+
+	const session = await c.env.DB.prepare(`SELECT * FROM quiz_sessions WHERE id = ? AND user_id = ?`)
+		.bind(sessionId, userId)
+		.first<QuizSessionRecord>();
+
+	if (!session) {
+		return c.json({ error: 'Session not found' }, 404);
+	}
+
+	if (session.status !== 'pending' && session.status !== 'processing') {
+		return c.json({ error: `Session is already ${session.status}, cannot cancel` }, 409);
+	}
+
+	const now = new Date().toISOString();
+
+	await c.env.DB.batch([
+		c.env.DB.prepare(`UPDATE quiz_sessions SET status = 'failed', completed_at = ? WHERE id = ?`)
+			.bind(now, sessionId),
+		c.env.DB.prepare(`UPDATE quizzes SET status = 'failed', updated_at = ? WHERE id = ?`)
+			.bind(now, sessionId),
+	]);
+
+	return c.json({ data: { sessionId, status: 'failed' } });
+});
+
 // ===== OCR 路由 =====
 
 /**
