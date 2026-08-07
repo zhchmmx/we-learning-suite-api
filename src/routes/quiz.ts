@@ -278,7 +278,7 @@ quiz.get('/quizzes/:id/questions', authMiddleware, async (c) => {
 /**
  * POST /sessions
  * 创建 quiz session 并服务端触发 AI Worker（需要用户 JWT）
- * 同时创建 Quiz 实体（status=generating），quiz_id = session_id
+ * 支持重试：同一文档失败后可重新触发，复用 quiz_id。
  */
 quiz.post('/sessions', authMiddleware, async (c) => {
 	const userId = c.get('userId');
@@ -309,26 +309,121 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 		}, 415);
 	}
 
-	// 生成 ticket（同时也是 quiz_id）
+	// 检查该文档是否已有 Quiz（UNIQUE 约束：一个文档只有一个 quiz）
+	const existingQuiz = await c.env.DB.prepare(
+		`SELECT id, status FROM quizzes WHERE source_file_id = ? AND user_id = ?`
+	)
+		.bind(body.sourceFileId, userId)
+		.first<{ id: string; status: string }>();
+
+	if (existingQuiz) {
+		// ── generating：上一次还在跑（可能客户端断连但 AI 仍在处理），直接返回已有 quizId ──
+		if (existingQuiz.status === 'generating') {
+			return c.json({
+				data: {
+					quizId: existingQuiz.id,
+					sessionId: existingQuiz.id,
+					sourceFileName: file.name,
+					status: 'generating',
+					expiresIn: TICKET_TTL_SECONDS,
+				},
+			});
+		}
+
+		// ── completed：已经出好题了，无需重试 ──
+		if (existingQuiz.status === 'completed') {
+			return c.json({
+				data: {
+					quizId: existingQuiz.id,
+					sessionId: existingQuiz.id,
+					sourceFileName: file.name,
+					status: 'completed',
+				},
+			});
+		}
+
+		// ── failed：清理残留 → 重置状态 → 新建 session → 重新触发 AI ──
+		if (existingQuiz.status === 'failed') {
+			const now = new Date();
+			const expiresAt = new Date(now.getTime() + TICKET_TTL_SECONDS * 1000);
+			const newSessionId = crypto.randomUUID();
+
+			try {
+				// 清理上次可能残留的题目 + 重置 quiz 状态 + 创建新 session
+				await c.env.DB.batch([
+					c.env.DB.prepare(`DELETE FROM questions WHERE quiz_id = ?`).bind(existingQuiz.id),
+					c.env.DB.prepare(`UPDATE quizzes SET status = 'generating', updated_at = ? WHERE id = ?`)
+						.bind(now.toISOString(), existingQuiz.id),
+					c.env.DB.prepare(
+						`INSERT INTO quiz_sessions (id, user_id, quiz_id, source_file_id, status, expires_at, created_at)
+						 VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+					).bind(newSessionId, userId, existingQuiz.id, body.sourceFileId, expiresAt.toISOString(), now.toISOString()),
+				]);
+			} catch (err) {
+				console.error('DB error during quiz retry:', err);
+				return c.json({ error: '数据库异常，请稍后重试' }, 500);
+			}
+
+			// 重新触发 AI Worker
+			let triggerOk = false;
+			try {
+				const triggerRes = await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/quiz/generate', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						ticket: existingQuiz.id,
+						materials: [{ r2Key: file.r2_key, mimeType: file.mime_type }],
+					}),
+					signal: AbortSignal.timeout(15000),
+				});
+				triggerOk = triggerRes.ok;
+			} catch {
+				triggerOk = false;
+			}
+
+			if (!triggerOk) {
+				// 触发失败：只清理新 session，quiz 保持 failed
+				await c.env.DB.prepare(`DELETE FROM quiz_sessions WHERE id = ?`).bind(newSessionId).run();
+				return c.json({ error: 'AI 服务暂时不可用，请稍后重试' }, 503);
+			}
+
+			return c.json({
+				data: {
+					quizId: existingQuiz.id,
+					sessionId: newSessionId,
+					sourceFileName: file.name,
+					status: 'generating',
+					expiresIn: TICKET_TTL_SECONDS,
+				},
+			});
+		}
+	}
+
+	// ── 全新创建 ──
 	const ticketId = crypto.randomUUID();
 	const now = new Date();
 	const expiresAt = new Date(now.getTime() + TICKET_TTL_SECONDS * 1000);
 
-	// 1. 创建 Quiz 实体（持久化）
-	await c.env.DB.prepare(
-		`INSERT INTO quizzes (id, user_id, source_file_id, name, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, 'generating', ?, ?)`
-	)
-		.bind(ticketId, userId, body.sourceFileId, file.name, now.toISOString(), now.toISOString())
-		.run();
+	try {
+		// 1. 创建 Quiz 实体（持久化）
+		await c.env.DB.prepare(
+			`INSERT INTO quizzes (id, user_id, source_file_id, name, status, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'generating', ?, ?)`
+		)
+			.bind(ticketId, userId, body.sourceFileId, file.name, now.toISOString(), now.toISOString())
+			.run();
 
-	// 2. 创建出题会话（临时，到期自动清理）
-	await c.env.DB.prepare(
-		`INSERT INTO quiz_sessions (id, user_id, quiz_id, source_file_id, status, expires_at, created_at)
-		 VALUES (?, ?, ?, ?, 'pending', ?, ?)`
-	)
-		.bind(ticketId, userId, ticketId, body.sourceFileId, expiresAt.toISOString(), now.toISOString())
-		.run();
+		// 2. 创建出题会话（临时，到期自动清理）
+		await c.env.DB.prepare(
+			`INSERT INTO quiz_sessions (id, user_id, quiz_id, source_file_id, status, expires_at, created_at)
+			 VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+		)
+			.bind(ticketId, userId, ticketId, body.sourceFileId, expiresAt.toISOString(), now.toISOString())
+			.run();
+	} catch (err) {
+		console.error('DB error during quiz creation:', err);
+		return c.json({ error: '数据库异常，请稍后重试' }, 500);
+	}
 
 	// 3. 服务端触发 AI Worker（Service Binding 内部直连，直接传 R2 key）
 	let triggerOk = false;
