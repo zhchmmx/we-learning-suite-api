@@ -546,6 +546,30 @@ quiz.patch('/sessions/:id/status', ticketAuthMiddleware, async (c) => {
 	return c.json({ data: { sessionId, quizId: sessionId, status: body.status } });
 });
 
+/**
+ * POST /sessions/:id/renew
+ * AI Worker 续期 ticket（需要 ticket 认证）。
+ * 将 expires_at 往后推 TICKET_TTL_SECONDS，防止长时生成任务中途过期。
+ */
+quiz.post('/sessions/:id/renew', ticketAuthMiddleware, async (c) => {
+	const sessionId = c.req.param('id');
+	const contextSessionId = c.get('sessionId');
+
+	if (sessionId !== contextSessionId) {
+		return c.json({ error: 'Ticket does not match this session' }, 403);
+	}
+
+	const now = new Date();
+	const expiresAt = new Date(now.getTime() + TICKET_TTL_SECONDS * 1000);
+
+	await c.env.DB
+		.prepare(`UPDATE quiz_sessions SET expires_at = ? WHERE id = ?`)
+		.bind(expiresAt.toISOString(), sessionId)
+		.run();
+
+	return c.json({ data: { sessionId, expiresAt: expiresAt.toISOString() } });
+});
+
 // ===== OCR 路由 =====
 
 /**
