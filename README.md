@@ -484,7 +484,7 @@ Authorization: Bearer <jwt>
 #### 获取 Quiz 下的题目
 
 ```
-GET /api/quiz/quizzes/:id/questions?due=true&type=single_choice&page=1&limit=20
+GET /api/quiz/quizzes/:id/questions?due=true&type=single_answer&page=1&limit=20
 Authorization: Bearer <jwt>
 ```
 
@@ -613,7 +613,7 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| type | string | 是 | 题型标识（如 single_choice, true_false, fill_blank） |
+| type | string | 是 | 题型标识（如 single_answer, true_false, fill_blank） |
 | content | object | 是 | 题目内容（JSON，结构随题型变化） |
 | answer | object | 是 | 正确答案（JSON） |
 | tags | string[] | 否 | 标签 |
@@ -623,7 +623,7 @@ Content-Type: application/json
 {
   "questions": [
     {
-      "type": "single_choice",
+      "type": "single_answer",
       "content": { "stem": "2+2等于?", "options": ["3", "4", "5", "6"] },
       "answer": { "correctIndex": 1 },
       "tags": ["数学", "基础运算"]
@@ -680,7 +680,7 @@ Authorization: Bearer <jwt>
       {
         "id": "uuid-1",
         "quizId": "quiz-uuid",
-        "type": "single_choice",
+        "type": "single_answer",
         "content": { "stem": "2+2等于?", "options": ["3", "4", "5", "6"] },
         "answer": { "correctIndex": 1 },
         "tags": ["数学"],
