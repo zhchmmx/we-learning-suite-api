@@ -3,6 +3,7 @@ import type { AppEnv, QuizListItem } from '../types';
 import { authMiddleware } from '../auth';
 import { ticketAuthMiddleware } from '../middleware/ticket-auth';
 import { isAllowedUploadMime } from './files';
+import { stripExtension } from '../utils/filename';
 
 const quiz = new Hono<AppEnv>();
 
@@ -95,7 +96,7 @@ quiz.get('/quizzes', authMiddleware, async (c) => {
 		id: q.id as string,
 		name: q.name as string,
 		sourceFileId: q.source_file_id as string,
-		sourceFileName: q.source_file_name as string,
+		sourceFileName: stripExtension(q.source_file_name as string),
 		totalQuestions: q.total_questions as number,
 		graduatedQuestions: q.graduated_questions as number,
 		status: q.status as 'generating' | 'completed' | 'failed',
@@ -135,7 +136,7 @@ quiz.get('/quizzes/:id', authMiddleware, async (c) => {
 			id: q.id,
 			name: q.name,
 			sourceFileId: q.source_file_id,
-			sourceFileName: q.source_file_name,
+			sourceFileName: stripExtension(q.source_file_name as string),
 			totalQuestions: q.total_questions,
 			graduatedQuestions: q.graduated_questions,
 			status: q.status,
@@ -323,7 +324,7 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 				data: {
 					quizId: existingQuiz.id,
 					sessionId: existingQuiz.id,
-					sourceFileName: file.name,
+					sourceFileName: stripExtension(file.name),
 					status: 'generating',
 					expiresIn: TICKET_TTL_SECONDS,
 				},
@@ -336,7 +337,7 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 				data: {
 					quizId: existingQuiz.id,
 					sessionId: existingQuiz.id,
-					sourceFileName: file.name,
+					sourceFileName: stripExtension(file.name),
 					status: 'completed',
 				},
 			});
@@ -391,7 +392,7 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 				data: {
 					quizId: existingQuiz.id,
 					sessionId: newSessionId,
-					sourceFileName: file.name,
+					sourceFileName: stripExtension(file.name),
 					status: 'generating',
 					expiresIn: TICKET_TTL_SECONDS,
 				},
@@ -406,11 +407,13 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 
 	try {
 		// 1. 创建 Quiz 实体（持久化）
+		// quizzes.name 是 Quiz 的展示标题（用户之后可通过 PATCH 改名），
+		// 默认取源文件名并去掉扩展名，避免标题里出现 ".txt"。
 		await c.env.DB.prepare(
 			`INSERT INTO quizzes (id, user_id, source_file_id, name, status, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, 'generating', ?, ?)`
 		)
-			.bind(ticketId, userId, body.sourceFileId, file.name, now.toISOString(), now.toISOString())
+			.bind(ticketId, userId, body.sourceFileId, stripExtension(file.name), now.toISOString(), now.toISOString())
 			.run();
 
 		// 2. 创建出题会话（临时，到期自动清理）
@@ -455,7 +458,7 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 		data: {
 			quizId: ticketId,
 			sessionId: ticketId,
-			sourceFileName: file.name,
+			sourceFileName: stripExtension(file.name),
 			status: 'generating',
 			expiresIn: TICKET_TTL_SECONDS,
 		},
@@ -487,6 +490,9 @@ quiz.get('/sessions/:id', authMiddleware, async (c) => {
 		return c.json({
 			data: {
 				quizId: q.id,
+				// 这里取的是 quizzes.name（Quiz 自己的标题，用户可 PATCH 改名），
+				// 建 Quiz 时已经去过扩展名，此处不再剥离，
+				// 否则会误伤"第3章.复习"这类用户自定义标题。
 				sourceFileName: q.name,
 				status: q.status,
 				createdAt: q.created_at,

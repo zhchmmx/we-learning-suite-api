@@ -85,6 +85,33 @@ GET /health
 
 ---
 
+### 关于文件名与扩展名
+
+**所有展示用的文件名字段都不含扩展名。** 上传 `notes.txt`，列表和详情接口返回的 `name` 就是 `notes`。
+
+数据库和 R2 中始终保存**完整文件名**，剥离只发生在响应出口层，因此下载链路不受影响。
+
+| 字段 | 所属接口 | 是否含扩展名 |
+|------|----------|--------------|
+| `data.name` | `POST /upload`、`GET /`、`GET /:id`、`PATCH /:id` | 否 |
+| `data.files[].name` | `GET /`（列表） | 否 |
+| `sourceFileName` | 全部 quiz 接口 | 否 |
+| `Content-Disposition` 的 filename | `GET /:id/download` | **是** |
+| `data.fileName` | `POST /presign/download/:id` | **是** |
+
+剥离规则采用**扩展名白名单**：`txt` `md` `markdown` `pdf` `doc` `docx` `ppt` `pptx` `xls` `xlsx` `csv` `rtf` `html` `htm` `epub`。不在名单内的一律原样保留，避免误伤 `v1.2.3`、`第一季度.2024` 这类带点的普通文件名。仅剥离最后一段，`backup.2024.txt` → `backup.2024`。
+
+**客户端注意事项：**
+
+- 需要判断文件类型请用 `mimeType` 字段，不要解析 `name`
+- 需要完整文件名（例如另存为）请用 `POST /presign/download/:id` 返回的 `fileName`
+- 同目录下的 `a.txt` 和 `a.md` 会都显示为 `a`，用 `mimeType` 区分
+- 重命名时传不带扩展名的新名字即可，服务端会自动补回原扩展名
+
+实现见 `src/utils/filename.ts`。
+
+---
+
 ### 上传文件（小文件，≤100MB）
 
 ```
@@ -134,7 +161,7 @@ curl -X POST https://your-worker.workers.dev/api/files/upload \
 {
   "data": {
     "id": "a1b2c3d4-...",
-    "name": "notes.txt",
+    "name": "notes",
     "path": "/math/",
     "size": 102400,
     "mimeType": "text/plain",
@@ -171,7 +198,7 @@ GET /api/files?path=/&page=1&limit=50&recursive=false
     "files": [
       {
         "id": "a1b2c3d4-...",
-        "name": "homework.pdf",
+        "name": "homework",
         "path": "/math/",
         "size": 102400,
         "mimeType": "application/pdf",
@@ -199,7 +226,7 @@ GET /api/files/:id
 {
   "data": {
     "id": "a1b2c3d4-...",
-    "name": "homework.pdf",
+    "name": "homework",
     "path": "/math/",
     "size": 102400,
     "mimeType": "application/pdf",
@@ -218,6 +245,9 @@ GET /api/files/:id/download
 ```
 
 返回文件二进制流，附带 `Content-Type` 和 `Content-Disposition` 头。
+
+> `Content-Disposition` 中的文件名是**含扩展名的完整名**（如 `notes.txt`），
+> 与 JSON 响应里的 `name` 字段（已去扩展名）语义不同。详见下方「关于文件名与扩展名」。
 
 ```bash
 curl -O -J \
@@ -249,7 +279,7 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| name | string | 否 | 新文件名 |
+| name | string | 否 | 新文件名（可不带扩展名，服务端会自动补回原扩展名） |
 | path | string | 否 | 新目录路径 |
 
 至少提供一个字段。
@@ -258,10 +288,13 @@ Content-Type: application/json
 curl -X PATCH https://your-worker.workers.dev/api/files/a1b2c3d4-... \
   -H "Authorization: Bearer <jwt>" \
   -H "Content-Type: application/json" \
-  -d '{"name": "final-homework.pdf", "path": "/math/semester1/"}'
+  -d '{"name": "final-homework", "path": "/math/semester1/"}'
 ```
 
-**响应：** 返回更新后的文件元信息。
+**响应：** 返回更新后的文件元信息（`name` 已去扩展名）。
+
+> 传 `"final-homework"`（不带扩展名）时，服务端会自动补回原文件的扩展名再入库，
+> 实际存储为 `final-homework.pdf`。若你显式传了 `"final-homework.md"`，则以你传的为准。
 
 ---
 
@@ -425,9 +458,9 @@ Authorization: Bearer <jwt>
   "data": [
     {
       "id": "quiz-uuid",
-      "name": "math-chapter3.txt",
+      "name": "math-chapter3",
       "sourceFileId": "file-uuid",
-      "sourceFileName": "math-chapter3.txt",
+      "sourceFileName": "math-chapter3",
       "totalQuestions": 25,
       "masteredQuestions": 8,
       "status": "completed",
@@ -542,7 +575,7 @@ curl -X POST https://your-worker.workers.dev/api/quiz/sessions \
   "data": {
     "quizId": "a1b2c3d4-...",
     "sessionId": "a1b2c3d4-...",
-    "sourceFileName": "math-chapter3.txt",
+    "sourceFileName": "math-chapter3",
     "status": "generating",
     "expiresIn": 1800
   }

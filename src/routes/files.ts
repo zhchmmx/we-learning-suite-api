@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, FileRecord, FileMetadataResponse, ListFilesResponse } from '../types';
 import { generatePresignedUrl } from '../services/presign';
+import { stripExtension, restoreExtension } from '../utils/filename';
 
 const files = new Hono<AppEnv>();
 
@@ -25,10 +26,16 @@ const UPLOAD_FORMAT_ERROR =
 
 // ===== 工具函数 =====
 
+/**
+ * 将 D1 记录转为对外响应。
+ *
+ * ⚠️ name 字段会剥离扩展名（"notes.txt" → "notes"）。D1 中仍存完整名，
+ * 只是展示时过滤掉后缀。需要完整名的场景（下载落盘）请勿复用此函数。
+ */
 function toResponse(record: FileRecord & { quiz_status?: string | null }): FileMetadataResponse {
 	return {
 		id: record.id,
-		name: record.name,
+		name: stripExtension(record.name),
 		path: record.path,
 		size: record.size,
 		mimeType: record.mime_type,
@@ -251,6 +258,8 @@ files.get('/:id/download', async (c) => {
 	}
 
 	// 流式返回，附带正确的 Content-Type 和下载文件名
+	// ⚠️ 这里刻意使用完整文件名（含扩展名）：这是客户端落盘用的名字，
+	// 去掉扩展名会导致下载的文件无法被系统正确识别打开。
 	const headers = new Headers();
 	headers.set('Content-Type', record.mime_type);
 	headers.set('Content-Length', String(record.size));
@@ -322,7 +331,10 @@ files.patch('/:id', async (c) => {
 		return c.json({ error: 'File not found' }, 404);
 	}
 
-	const newName = body.name || record.name;
+	// 客户端拿到的 name 是剥离过扩展名的，改名后传回来若不带扩展名，
+	// 需要补回原文件的扩展名，否则 D1 里的完整名会丢后缀，
+	// 导致后续下载没有扩展名、AI 也判断不出文件类型。
+	const newName = body.name ? restoreExtension(body.name, record.name) : record.name;
 	const newPath = body.path ? normalizePath(body.path) : record.path;
 
 	// 如果路径变了，需要移动 R2 对象
@@ -594,6 +606,8 @@ files.post('/presign/download/:id', async (c) => {
 		data: {
 			downloadUrl,
 			expiresIn: 900,
+			// ⚠️ 刻意保留完整文件名（含扩展名）：客户端用它落盘，
+			// 与其它接口返回的展示用 name（已剥离扩展名）语义不同。
 			fileName: record.name,
 			mimeType: record.mime_type,
 		},

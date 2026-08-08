@@ -39,6 +39,11 @@ export interface FileRecord {
 
 export interface FileMetadataResponse {
 	id: string;
+	/**
+	 * 展示用文件名，**不含扩展名**（"notes.txt" → "notes"）。
+	 * D1 中仍存完整名，只在响应出口剥离。需要判断文件类型请用 mimeType；
+	 * 需要完整名（下载落盘）请用 POST /presign/download/:id 返回的 fileName。
+	 */
 	name: string;
 	path: string;
 	size: number;
@@ -83,8 +88,10 @@ export interface QuizRecord {
 /** Quiz 列表响应项（聚合了文件信息和题目统计） */
 export interface QuizListItem {
 	id: string;
+	/** Quiz 标题。创建时默认取源文件名（已去扩展名），之后可通过 PATCH 改名 */
 	name: string;
 	sourceFileId: string;
+	/** 源文件名，**不含扩展名**（"notes.txt" → "notes"） */
 	sourceFileName: string;
 	totalQuestions: number;
 	graduatedQuestions: number;
