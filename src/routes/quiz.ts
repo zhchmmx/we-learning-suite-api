@@ -613,7 +613,10 @@ quiz.post('/sessions/:id/cancel', authMiddleware, async (c) => {
 
 /**
  * POST /ocr
- * 图片转文字（需要用户 JWT）。
+ * 图片转文字（需要用户 JWT）。异步：
+ * AI Worker 接收后立即返回 { taskId, status: "processing" }（202），
+ * 实际 OCR 由 AI Worker 的 Durable Object alarm 状态机处理。
+ * 客户端通过 GET /ocr/status/:taskId 轮询结果。
  */
 quiz.post('/ocr', authMiddleware, async (c) => {
 	const body = c.req.raw.body;
@@ -627,8 +630,36 @@ quiz.post('/ocr', authMiddleware, async (c) => {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body,
-			signal: AbortSignal.timeout(5 * 60 * 1000),
+			// AI Worker 现在立即返回 202（异步），不再同步等 OCR 结果
+			signal: AbortSignal.timeout(15_000),
 		});
+	} catch {
+		return c.json({ error: 'OCR 服务暂时不可用，请稍后重试' }, 502);
+	}
+
+	return new Response(res.body, {
+		status: res.status,
+		headers: { 'Content-Type': 'application/json' },
+	});
+});
+
+/**
+ * GET /ocr/status/:taskId
+ * 轮询 OCR 任务进度和结果（需要用户 JWT）。
+ * 透明转发到 AI Worker 的异步状态端点。
+ */
+quiz.get('/ocr/status/:taskId', authMiddleware, async (c) => {
+	const taskId = c.req.param('taskId');
+	if (!taskId) {
+		return c.json({ error: 'taskId is required' }, 400);
+	}
+
+	let res: Response;
+	try {
+		res = await c.env.AI_WORKER.fetch(
+			`http://we-learning-suite-ai/api/ocr/status/${encodeURIComponent(taskId)}`,
+			{ signal: AbortSignal.timeout(10_000) },
+		);
 	} catch {
 		return c.json({ error: 'OCR 服务暂时不可用，请稍后重试' }, 502);
 	}
