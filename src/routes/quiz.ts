@@ -35,6 +35,7 @@ interface QuizSessionRecord {
 	expires_at: string;
 	created_at: string;
 	completed_at: string | null;
+	fail_reason: string | null;
 }
 
 // ===== 辅助函数 =====
@@ -353,7 +354,7 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 				// 清理上次可能残留的题目 + 重置 quiz 状态 + 创建新 session
 				await c.env.DB.batch([
 					c.env.DB.prepare(`DELETE FROM questions WHERE quiz_id = ?`).bind(existingQuiz.id),
-					c.env.DB.prepare(`UPDATE quizzes SET status = 'generating', updated_at = ? WHERE id = ?`)
+					c.env.DB.prepare(`UPDATE quizzes SET status = 'generating', updated_at = ?, fail_reason = NULL WHERE id = ?`)
 						.bind(now.toISOString(), existingQuiz.id),
 					c.env.DB.prepare(
 						`INSERT INTO quiz_sessions (id, user_id, quiz_id, source_file_id, status, expires_at, created_at)
@@ -481,7 +482,7 @@ quiz.get('/sessions/:id', authMiddleware, async (c) => {
 		// 也查一下 quiz（session 可能已被清理但 quiz 还在）
 		const q = await c.env.DB.prepare(`SELECT * FROM quizzes WHERE id = ? AND user_id = ?`)
 			.bind(sessionId, userId)
-			.first<{ id: string; name: string; source_file_id: string; status: string; created_at: string; updated_at: string }>();
+			.first<{ id: string; name: string; source_file_id: string; status: string; created_at: string; updated_at: string; fail_reason: string | null }>();
 
 		if (!q) {
 			return c.json({ error: 'Quiz not found' }, 404);
@@ -495,6 +496,7 @@ quiz.get('/sessions/:id', authMiddleware, async (c) => {
 				// 否则会误伤"第3章.复习"这类用户自定义标题。
 				sourceFileName: q.name,
 				status: q.status,
+				failReason: q.fail_reason ?? null,
 				createdAt: q.created_at,
 			},
 		});
@@ -506,6 +508,7 @@ quiz.get('/sessions/:id', authMiddleware, async (c) => {
 			sessionId: session.id,
 			sourceFileId: session.source_file_id,
 			status: session.status,
+			failReason: session.fail_reason ?? null,
 			createdAt: session.created_at,
 			completedAt: session.completed_at,
 			expiresAt: session.expires_at,
@@ -526,7 +529,7 @@ quiz.patch('/sessions/:id/status', ticketAuthMiddleware, async (c) => {
 		return c.json({ error: 'Ticket does not match this session' }, 403);
 	}
 
-	let body: { status: string };
+	let body: { status: string; reason?: string };
 	try {
 		body = await c.req.json();
 	} catch {
@@ -538,18 +541,26 @@ quiz.patch('/sessions/:id/status', ticketAuthMiddleware, async (c) => {
 		return c.json({ error: `Status must be one of: ${validStatuses.join(', ')}` }, 400);
 	}
 
+	// 失败原因码白名单（AI Worker 内容审核判定），仅 failed 状态可携带
+	const FAIL_REASONS = ['CONTENT_BLOCKED', 'CONTENT_REVIEW_PENDING', 'CONTENT_SCAN_UNAVAILABLE'];
+	if (body.reason !== undefined && (body.status !== 'failed' || !FAIL_REASONS.includes(body.reason))) {
+		return c.json({ error: `"reason" must be one of: ${FAIL_REASONS.join(', ')} and only when status is failed` }, 400);
+	}
+	const failReason = body.status === 'failed' ? body.reason ?? null : null;
+
 	const completedAt = body.status === 'completed' || body.status === 'failed' ? new Date().toISOString() : null;
 	const now = new Date().toISOString();
 
 	// 同步更新 session 和 quiz 状态
 	await c.env.DB.batch([
-		c.env.DB.prepare(`UPDATE quiz_sessions SET status = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?`)
-			.bind(body.status, completedAt, sessionId),
-		c.env.DB.prepare(`UPDATE quizzes SET status = ?, updated_at = ? WHERE id = ?`)
-			.bind(body.status, now, sessionId),
+		c.env.DB.prepare(
+			`UPDATE quiz_sessions SET status = ?, completed_at = COALESCE(?, completed_at), fail_reason = ? WHERE id = ?`
+		).bind(body.status, completedAt, failReason, sessionId),
+		c.env.DB.prepare(`UPDATE quizzes SET status = ?, updated_at = ?, fail_reason = ? WHERE id = ?`)
+			.bind(body.status, now, failReason, sessionId),
 	]);
 
-	return c.json({ data: { sessionId, quizId: sessionId, status: body.status } });
+	return c.json({ data: { sessionId, quizId: sessionId, status: body.status, failReason } });
 });
 
 /**
