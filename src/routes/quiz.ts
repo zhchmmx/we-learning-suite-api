@@ -374,6 +374,7 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({
 						ticket: existingQuiz.id,
+						userId,
 						materials: [{ r2Key: file.r2_key, mimeType: file.mime_type }],
 					}),
 					signal: AbortSignal.timeout(15000),
@@ -437,6 +438,7 @@ quiz.post('/sessions', authMiddleware, async (c) => {
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				ticket: ticketId,
+				userId,
 				materials: [{ r2Key: file.r2_key, mimeType: file.mime_type }],
 			}),
 			signal: AbortSignal.timeout(15000),
@@ -630,17 +632,22 @@ quiz.post('/sessions/:id/cancel', authMiddleware, async (c) => {
  * 客户端通过 GET /ocr/status/:taskId 轮询结果。
  */
 quiz.post('/ocr', authMiddleware, async (c) => {
-	const body = c.req.raw.body;
-	if (!body) {
-		return c.json({ error: 'Empty request body' }, 400);
+	let payload: Record<string, unknown>;
+	try {
+		payload = (await c.req.json()) as Record<string, unknown>;
+	} catch {
+		return c.json({ error: 'Invalid JSON body' }, 400);
 	}
+
+	// 注入发起用户，随图片一起透传给 AI Worker → OCR 模型调用（AI Gateway 请求标识）
+	payload.userId = c.get('userId');
 
 	let res: Response;
 	try {
 		res = await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/ocr', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body,
+			body: JSON.stringify(payload),
 			// AI Worker 现在立即返回 202（异步），不再同步等 OCR 结果
 			signal: AbortSignal.timeout(15_000),
 		});
