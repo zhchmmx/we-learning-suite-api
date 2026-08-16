@@ -4,6 +4,7 @@ import type { AppEnv } from './types';
 import { authMiddleware } from './auth';
 import { files } from './routes/files';
 import { quiz } from './routes/quiz';
+import { usage } from './routes/usage';
 
 const app = new Hono<AppEnv>();
 
@@ -28,6 +29,9 @@ app.route('/api/files', files);
 
 // We Quiz 路由（鉴权在各路由内部处理：JWT 或 ticket）
 app.route('/api/quiz', quiz);
+
+// AI 用量路由（JWT 鉴权，聚合在 AI Worker 完成）
+app.route('/api/usage', usage);
 
 // 404 兜底
 app.notFound((c) => {
