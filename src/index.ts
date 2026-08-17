@@ -31,7 +31,7 @@ app.route('/api/files', files);
 app.route('/api/quiz', quiz);
 
 // AI 用量路由（JWT 鉴权，聚合在 AI Worker 完成）
-app.route('/api/usage', usage);
+app.route('/usage', usage);
 
 // 404 兜底
 app.notFound((c) => {
