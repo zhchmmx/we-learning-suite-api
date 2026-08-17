@@ -10,6 +10,7 @@ export interface AppEnv {
 		DB: D1Database;
 		APPWRITE_ENDPOINT: string;
 		APPWRITE_PROJECT_ID: string;
+		APPWRITE_FUNCTION_ID: string;
 		// Service Binding：内部直连出题 AI Worker（不走公网，无需 URL 和令牌）
 		AI_WORKER: Fetcher;
 		// 以下通过 wrangler secret put 设置

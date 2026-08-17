@@ -41,7 +41,8 @@
 	// 非敏感环境变量（敏感信息用 wrangler secret put 设置）
 	"vars": {
 		"APPWRITE_ENDPOINT": "https://sgp.cloud.appwrite.io/v1",
-		"APPWRITE_PROJECT_ID": "6a6c7036001a06ffc393"
+		"APPWRITE_PROJECT_ID": "6a6c7036001a06ffc393",
+		"APPWRITE_FUNCTION_ID": "6a784dd9002e0069cf39"
 	}
 
 	// 以下变量通过 `npx wrangler secret put <NAME>` 设置，不写在配置文件里：

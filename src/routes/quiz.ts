@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { AppEnv, QuizListItem } from '../types';
 import { authMiddleware } from '../auth';
 import { ticketAuthMiddleware } from '../middleware/ticket-auth';
+import { quotaCheckMiddleware } from '../middleware/quota-check';
 import { isAllowedUploadMime } from './files';
 import { stripExtension } from '../utils/filename';
 
@@ -282,7 +283,7 @@ quiz.get('/quizzes/:id/questions', authMiddleware, async (c) => {
  * 创建 quiz session 并服务端触发 AI Worker（需要用户 JWT）
  * 支持重试：同一文档失败后可重新触发，复用 quiz_id。
  */
-quiz.post('/sessions', authMiddleware, async (c) => {
+quiz.post('/sessions', authMiddleware, quotaCheckMiddleware, async (c) => {
 	const userId = c.get('userId');
 
 	let body: { sourceFileId: string };
@@ -631,7 +632,7 @@ quiz.post('/sessions/:id/cancel', authMiddleware, async (c) => {
  * 实际 OCR 由 AI Worker 的 Durable Object alarm 状态机处理。
  * 客户端通过 GET /ocr/status/:taskId 轮询结果。
  */
-quiz.post('/ocr', authMiddleware, async (c) => {
+quiz.post('/ocr', authMiddleware, quotaCheckMiddleware, async (c) => {
 	let payload: Record<string, unknown>;
 	try {
 		payload = (await c.req.json()) as Record<string, unknown>;
