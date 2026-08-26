@@ -20,6 +20,7 @@ interface UsageResponse {
  *
  * 在触发 AI 生成之前检查用户当月用量是否超过 quotaLimit：
  * 1. 调 Appwrite Function 拿 subscription.quotaLimit
+ *    - 若用户无任何订阅记录，自动调 init-free 创建免费订阅
  * 2. 调 AI Worker /api/usage 拿当月 cost
  * 3. 超额返回 429 QUOTA_EXCEEDED，否则放行
  */
@@ -35,32 +36,50 @@ export const quotaCheckMiddleware = createMiddleware<AppEnv>(async (c, next) => 
 	let quotaLimit: number;
 	try {
 		const functionId = c.env.APPWRITE_FUNCTION_ID;
-		const res = await fetch(`${c.env.APPWRITE_ENDPOINT}/functions/${functionId}/executions`, {
+		const fnBase = `${c.env.APPWRITE_ENDPOINT}/functions/${functionId}/executions`;
+		const fnHeaders = {
+			'Content-Type': 'application/json',
+			'X-Appwrite-Project': c.env.APPWRITE_PROJECT_ID,
+			'X-Appwrite-JWT': jwt,
+		};
+
+		const res = await fetch(fnBase, {
 			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'X-Appwrite-Project': c.env.APPWRITE_PROJECT_ID,
-				'X-Appwrite-JWT': jwt,
-			},
-			body: JSON.stringify({
-				path: '/subscription/me',
-				method: 'GET',
-			}),
+			headers: fnHeaders,
+			body: JSON.stringify({ path: '/subscription/me', method: 'GET' }),
 		});
 
 		if (!res.ok) {
 			console.error(`Quota check: subscription fetch failed (${res.status})`);
-			// 拿不到额度时兜底放行，避免阻断用户
-			return await next();
-		}
+			quotaLimit = 0.5; // 兜底 free 额度
+		} else {
+			const data = (await res.json()) as { responseBody?: string };
+			const parsed = JSON.parse(data.responseBody || '{}') as SubscriptionResponse;
 
-		const data = (await res.json()) as { responseBody?: string };
-		const parsed = JSON.parse(data.responseBody || '{}') as SubscriptionResponse;
-		quotaLimit = parsed.subscription?.quotaLimit ?? 5; // 兜底 5
+			if (parsed.subscription) {
+				quotaLimit = parsed.subscription.quotaLimit ?? 0.5;
+			} else {
+				// 用户无任何订阅记录 → 自动初始化免费订阅
+				console.log(`Quota check: no subscription for ${userId}, auto-init free`);
+				const initRes = await fetch(fnBase, {
+					method: 'POST',
+					headers: fnHeaders,
+					body: JSON.stringify({ path: '/subscription/init-free', method: 'POST' }),
+				});
+
+				if (initRes.ok) {
+					const initData = (await initRes.json()) as { responseBody?: string };
+					const initParsed = JSON.parse(initData.responseBody || '{}') as SubscriptionResponse;
+					quotaLimit = initParsed.subscription?.quotaLimit ?? 0.5;
+				} else {
+					console.error(`Quota check: init-free failed (${initRes.status})`);
+					quotaLimit = 0.5;
+				}
+			}
+		}
 	} catch (err) {
 		console.error('Quota check: subscription error:', err);
-		// 出错时兜底放行
-		return await next();
+		quotaLimit = 0.5;
 	}
 
 	// 2. 调 AI Worker 拿当月用量
