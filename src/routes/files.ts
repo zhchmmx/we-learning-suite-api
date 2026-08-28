@@ -10,19 +10,34 @@ const BUCKET_NAME = 'we-learning-suite';
 // ===== 上传格式白名单 =====
 
 /**
- * 服务器只接受文本格式文件。
- * PDF / Office / 图片等由客户端在上传前转成文本（扫描件与图片走 OCR），
- * 保证 R2 里存的、出题管线吃的都只能是文本。
+ * 服务器接受原始文档直传：文本、PDF、Office/开放文档、HTML/CSV 与常见图片。
+ * 非文本格式在出题时由 AI Worker 服务端转换（AI.toMarkdown）或 OCR，客户端无需转码。
+ * PPTX / 老式 .doc/.ppt 不支持（转换服务不覆盖）。
  */
-const ALLOWED_UPLOAD_MIME_TYPES = new Set(['text/plain', 'text/markdown', 'text/x-markdown']);
+const ALLOWED_UPLOAD_MIME_TYPES = new Set([
+	// 文本（向后兼容旧客户端）
+	'text/plain', 'text/markdown', 'text/x-markdown',
+	// 文档
+	'application/pdf',
+	'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
+	'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // xlsx
+	'application/vnd.ms-excel', // xls
+	'application/vnd.oasis.opendocument.text', // odt
+	'application/vnd.oasis.opendocument.spreadsheet', // ods
+	'text/html',
+	'application/xml',
+	'text/csv',
+	// 图片（出题时走服务端 OCR 通道）
+	'image/jpeg', 'image/png', 'image/webp',
+]);
 
-/** 校验 MIME 是否为允许的文本格式（容忍 "text/plain; charset=utf-8" 这类带参数的写法） */
+/** 校验 MIME 是否为允许的格式（容忍 "text/plain; charset=utf-8" 这类带参数的写法） */
 export function isAllowedUploadMime(mimeType: string): boolean {
 	return ALLOWED_UPLOAD_MIME_TYPES.has(mimeType.toLowerCase().split(';')[0].trim());
 }
 
 const UPLOAD_FORMAT_ERROR =
-	'服务器只接受文本格式（txt / markdown）。PDF、Office、图片等请先在客户端转换为文本后再上传';
+	'不支持的文件格式。当前支持：txt / markdown / PDF / docx / xlsx / odt / ods / html / xml / csv / jpg / png / webp（不支持 PPT、PPTX）';
 
 // ===== 工具函数 =====
 
@@ -120,7 +135,7 @@ files.post('/upload', async (c) => {
 		return c.json({ error: 'Invalid file name. Cannot contain /\\:*?"<>| and must be 1-255 characters.' }, 400);
 	}
 
-	// 只接受文本格式（其余格式请先在客户端转成文本）
+	// 格式白名单校验（不在名单内的格式直接拒绝）
 	if (!isAllowedUploadMime(mimeType)) {
 		return c.json({ error: UPLOAD_FORMAT_ERROR }, 415);
 	}
@@ -491,7 +506,7 @@ files.post('/presign/upload', async (c) => {
 	const targetPath = normalizePath(body.path || '/');
 	const mimeType = body.mimeType || 'application/octet-stream';
 
-	// 预签名上传同样只接受文本格式
+	// 格式白名单校验（与 /upload 一致）
 	if (!isAllowedUploadMime(mimeType)) {
 		return c.json({ error: UPLOAD_FORMAT_ERROR }, 415);
 	}

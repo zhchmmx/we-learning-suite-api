@@ -308,7 +308,7 @@ quiz.post('/sessions', authMiddleware, quotaCheckMiddleware, async (c) => {
 
 	if (!isAllowedUploadMime(file.mime_type)) {
 		return c.json({
-			error: '该文档不是文本格式，无法生成题目。请将其转换为文本（txt/md）后重新上传',
+			error: '该文件格式不支持生成题目。请上传 txt / markdown / PDF / docx / xlsx / odt / ods / html / xml / csv / jpg / png / webp 格式',
 		}, 415);
 	}
 
