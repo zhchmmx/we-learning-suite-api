@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import * as Sentry from '@sentry/cloudflare';
 import type { AppEnv } from './types';
 import { authMiddleware } from './auth';
 import { files } from './routes/files';
@@ -39,9 +40,20 @@ app.notFound((c) => {
 });
 
 // 全局错误处理
+// 说明：Sentry 的 Hono 集成（@sentry/cloudflare）默认启用，会自动捕获 onError 中抛出的异常并上报；
+// 这里的 console.error 仅用于本地日志，与 Sentry 并存无冲突。
 app.onError((err, c) => {
 	console.error('Unhandled error:', err);
 	return c.json({ error: 'Internal server error' }, 500);
 });
 
-export default app;
+// 用 Sentry.withSentry 包裹 Hono 应用导出，尽早初始化 SDK。
+// DSN 从环境变量读取：本地放 .dev.vars，生产用 `wrangler secret put SENTRY_DSN`。
+// tracesSampleRate 上线稳定后建议下调（如 0.1）以控制配额。
+export default Sentry.withSentry(
+	(env): Sentry.CloudflareOptions => ({
+		dsn: env.SENTRY_DSN,
+		tracesSampleRate: 1.0,
+	}),
+	app,
+);
