@@ -86,10 +86,15 @@ function isValidFileName(name: string): boolean {
  * POST /upload
  * 上传文件（小文件，≤100MB，通过 Worker 流式中转）
  *
- * 请求：multipart/form-data
- *   - file: 文件内容（必填）
- *   - path: 目标目录路径（可选，默认 "/"）
- *   - name: 自定义文件名（可选，默认使用上传文件的原始名）
+ * 支持两种方式：
+ * 1. multipart/form-data
+ *    - file: 文件内容（必填）
+ *    - path: 目标目录路径（可选，默认 "/"）
+ *    - name: 自定义文件名（可选，默认使用上传文件的原始名）
+ * 2. 原始二进制流（文件内容直接作为请求体）
+ *    - X-File-Name: 文件名（必填）
+ *    - X-File-Path: 目标目录路径（可选，默认 "/"）
+ *    - Content-Type: MIME 类型（可选）
  */
 files.post('/upload', async (c) => {
 	const userId = c.get('userId');

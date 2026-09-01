@@ -15,9 +15,9 @@
  *   - "v1.2.3"        → 通用正则会剥成 "v1.2"
  *   - "第一季度.2024" → 通用正则会剥成 "第一季度"
  *
- * 服务端只接收 text/plain 与 text/markdown（见 routes/files.ts 的
- * ALLOWED_UPLOAD_MIME_TYPES），实际入库的扩展名几乎只有 txt/md，
- * 白名单的覆盖率接近 100%，"漏剥"这一缺点基本不会发生。
+ * 服务端接收文本、PDF/DOCX/XLSX 与常见图片（见 routes/files.ts 的
+ * ALLOWED_UPLOAD_MIME_TYPES），白名单已覆盖这些格式对应的扩展名，
+ * "漏剥"这一缺点基本不会发生。
  *
  * 需要支持新扩展名时，直接往这里加即可。
  */

@@ -1,6 +1,6 @@
 # we-learning-suite-api
 
-基于 Cloudflare Workers 的学习套件后端 API，使用 Appwrite JWT 鉴权，R2 存储文件本体，D1 存储元数据。包含文件管理和 We Quiz（题目存储 + 作答记录 + 艾宾浩斯调度）两大模块。
+基于 Cloudflare Workers 的学习套件后端 API，使用 Appwrite JWT 鉴权，R2 存储文件本体，D1 存储元数据。包含文件管理、We Quiz（AI 出题 + 作答记录 + 服务端毕业判定）和用量查询三大模块。
 
 ## 技术栈
 
@@ -8,6 +8,7 @@
 - **路由**: Hono
 - **存储**: R2（文件本体）+ D1（元数据）
 - **鉴权**: Appwrite JWT（通过 Appwrite REST API 验证）
+- **监控**: Sentry（`@sentry/cloudflare`）
 
 ## 快速开始
 
@@ -23,6 +24,7 @@ npm install
 
 - `APPWRITE_ENDPOINT`: 你的 Appwrite endpoint（如 `https://cloud.appwrite.io/v1`）
 - `APPWRITE_PROJECT_ID`: 你的 Appwrite 项目 ID
+- `APPWRITE_FUNCTION_ID`: 订阅服务 Function ID（用于查询 AI / 存储配额）
 - Service Binding `AI_WORKER`: 指向出题 AI Worker（we-learning-suite-ai），内部直连，不走公网、无需配置地址
 - D1 的 `database_id`: 在 Cloudflare 控制台 → D1 → 你的数据库 → Settings 中获取
 
@@ -32,6 +34,7 @@ npm install
 npx wrangler secret put R2_ACCESS_KEY_ID
 npx wrangler secret put R2_SECRET_ACCESS_KEY
 npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
+npx wrangler secret put SENTRY_DSN
 ```
 
 R2 API Token 在 Cloudflare 控制台 → R2 → Manage R2 API Tokens 中创建（需要 Object Read & Write 权限）。
@@ -60,7 +63,7 @@ npx wrangler deploy
 
 ## API 文档
 
-所有 `/api/files` 下的接口都需要在请求头中携带 Appwrite JWT：
+所有 `/api/files` 与 `/api/quiz` 的用户接口都需要在请求头中携带 Appwrite JWT：
 
 ```
 Authorization: Bearer <your-jwt-token>
@@ -112,13 +115,25 @@ GET /health
 
 ---
 
+### 上传格式白名单
+
+服务器接受以下格式的**原始文档直传**，客户端无需转码：
+
+- 文本：`text/plain`、`text/markdown`、`text/x-markdown`
+- 文档：PDF、DOCX、XLSX（出题时由 AI Worker 服务端 `AI.toMarkdown` 转换）
+- 图片：JPEG、PNG、WebP（出题时走服务端 OCR 通道）
+
+其他格式一律返回 415。
+
+---
+
 ### 上传文件（小文件，≤100MB）
 
 ```
 POST /api/files/upload
 ```
 
-**服务器只接受文本格式**（`text/plain`、`text/markdown`），其他 MIME 类型一律返回 415。PDF / Office / 图片由客户端在上传前转成文本（扫描件与图片经 `POST /api/quiz/ocr` 识别）。
+上传前会做**存储配额检查**（已用 + 本次大小 > 配额上限时返回 429，见「存储配额」）。
 
 支持两种方式：
 
@@ -126,7 +141,7 @@ POST /api/files/upload
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| file | File | 是 | 文件内容（文本格式） |
+| file | File | 是 | 文件内容 |
 | path | string | 否 | 目标目录，默认 `/` |
 | name | string | 否 | 自定义文件名，默认使用原始名 |
 
@@ -145,7 +160,7 @@ curl -X POST https://your-worker.workers.dev/api/files/upload \
 |--------|------|------|
 | X-File-Name | 是 | 文件名 |
 | X-File-Path | 否 | 目标目录，默认 `/` |
-| Content-Type | 否 | MIME 类型（必须是文本格式） |
+| Content-Type | 否 | MIME 类型（必须在白名单内） |
 
 ```bash
 curl -X POST https://your-worker.workers.dev/api/files/upload \
@@ -165,15 +180,32 @@ curl -X POST https://your-worker.workers.dev/api/files/upload \
     "path": "/math/",
     "size": 102400,
     "mimeType": "text/plain",
+    "hasThumbnail": false,
+    "quizStatus": "none",
     "createdAt": "2026-08-02T10:00:00.000Z",
     "updatedAt": "2026-08-02T10:00:00.000Z"
   }
 }
 ```
 
+- `quizStatus`：`none`（从未出题）/ `generating`（生成中）/ `completed`（已成功）/ `failed`（失败）
+
 **格式错误 (415)：**
 ```json
-{ "error": "服务器只接受文本格式（txt / markdown）。PDF、Office、图片等请先在客户端转换为文本后再上传" }
+{ "error": "不支持的文件格式。当前支持：txt / markdown / PDF / docx / xlsx / jpg / png / webp" }
+```
+
+**配额超限 (429)：**
+```json
+{
+  "error": {
+    "code": "STORAGE_QUOTA_EXCEEDED",
+    "message": "Storage quota exceeded",
+    "quotaLimitBytes": 524288000,
+    "currentUsageBytes": 520000000,
+    "requestedBytes": 10000000
+  }
+}
 ```
 
 ---
@@ -191,6 +223,8 @@ GET /api/files?path=/&page=1&limit=50&recursive=false
 | page | number | 1 | 页码 |
 | limit | number | 50 | 每页数量（最大 200） |
 
+只返回 `confirmed` 状态的文件（预签名上传未确认的 `pending` 文件不会出现）。
+
 **响应：**
 ```json
 {
@@ -202,6 +236,8 @@ GET /api/files?path=/&page=1&limit=50&recursive=false
         "path": "/math/",
         "size": 102400,
         "mimeType": "application/pdf",
+        "hasThumbnail": false,
+        "quizStatus": "completed",
         "createdAt": "2026-08-02T10:00:00.000Z",
         "updatedAt": "2026-08-02T10:00:00.000Z"
       }
@@ -215,26 +251,34 @@ GET /api/files?path=/&page=1&limit=50&recursive=false
 
 ---
 
-### 获取文件元信息
+### 查询存储配额
 
 ```
-GET /api/files/:id
+GET /api/files/quota
 ```
 
 **响应：**
 ```json
 {
   "data": {
-    "id": "a1b2c3d4-...",
-    "name": "homework",
-    "path": "/math/",
-    "size": 102400,
-    "mimeType": "application/pdf",
-    "createdAt": "2026-08-02T10:00:00.000Z",
-    "updatedAt": "2026-08-02T10:00:00.000Z"
+    "usedBytes": 104857600,
+    "quotaLimitBytes": 524288000,
+    "remainingBytes": 419430400
   }
 }
 ```
+
+配额上限来自订阅记录的 `storageLimit`；订阅缺失或查询失败时回退免费默认值 500 MB。
+
+---
+
+### 获取文件元信息
+
+```
+GET /api/files/:id
+```
+
+**响应：** 同上传响应结构（单个文件对象，`name` 已去扩展名）。
 
 ---
 
@@ -247,7 +291,7 @@ GET /api/files/:id/download
 返回文件二进制流，附带 `Content-Type` 和 `Content-Disposition` 头。
 
 > `Content-Disposition` 中的文件名是**含扩展名的完整名**（如 `notes.txt`），
-> 与 JSON 响应里的 `name` 字段（已去扩展名）语义不同。详见下方「关于文件名与扩展名」。
+> 与 JSON 响应里的 `name` 字段（已去扩展名）语义不同。详见上方「关于文件名与扩展名」。
 
 ```bash
 curl -O -J \
@@ -262,6 +306,8 @@ curl -O -J \
 ```
 DELETE /api/files/:id
 ```
+
+同时删除 R2 对象（含缩略图）和 D1 记录。
 
 **响应：**
 ```json
@@ -298,9 +344,30 @@ curl -X PATCH https://your-worker.workers.dev/api/files/a1b2c3d4-... \
 
 ---
 
+### 缩略图
+
+```
+POST /api/files/:id/thumbnail
+```
+
+上传/更新文件缩略图。请求体为图片二进制流（任意 `image/*`，常用 webp / jpeg / png），客户端负责生成缩略图，服务端只负责存储。
+
+**响应 (201)：**
+```json
+{ "data": { "fileId": "...", "thumbnailKey": "...", "contentType": "image/webp" } }
+```
+
+```
+GET /api/files/:id/thumbnail
+```
+
+流式返回缩略图图片（带 24 小时缓存头）。无缩略图时返回 404。
+
+---
+
 ### 大文件上传（>100MB，预签名 URL）
 
-分两步完成：
+分三步完成：
 
 #### 第一步：获取上传链接
 
@@ -314,7 +381,9 @@ Content-Type: application/json
 | name | string | 是 | 文件名 |
 | size | number | 是 | 文件大小（字节） |
 | path | string | 否 | 目标目录 |
-| mimeType | string | 否 | MIME 类型 |
+| mimeType | string | 否 | MIME 类型（必须在白名单内） |
+
+签发前会做存储配额检查（按声明的 `size` 计），超限返回 429（结构同上传接口）。
 
 **响应：**
 ```json
@@ -324,7 +393,7 @@ Content-Type: application/json
     "fileId": "a1b2c3d4-...",
     "r2Key": "userId/path/fileId",
     "expiresIn": 900,
-    "headers": { "Content-Type": "video/mp4" }
+    "headers": { "Content-Type": "application/pdf" }
   }
 }
 ```
@@ -333,11 +402,22 @@ Content-Type: application/json
 
 ```bash
 curl -X PUT "<uploadUrl>" \
-  -H "Content-Type: video/mp4" \
-  --data-binary @large-video.mp4
+  -H "Content-Type: application/pdf" \
+  --data-binary @large-doc.pdf
 ```
 
-上传完成后文件即可通过 `/api/files/:fileId` 访问。
+#### 第三步：确认上传完成
+
+```
+POST /api/files/presign/confirm/:fileId
+```
+
+**必须调用**，否则文件保持 `pending` 状态，不会出现在文件列表中。服务端会校验 R2 中对象存在且大小与声明一致。
+
+**响应：**
+```json
+{ "data": { "fileId": "a1b2c3d4-...", "status": "confirmed" } }
+```
 
 ---
 
@@ -353,8 +433,8 @@ POST /api/files/presign/download/:id
   "data": {
     "downloadUrl": "https://xxx.r2.cloudflarestorage.com/...",
     "expiresIn": 900,
-    "fileName": "large-video.mp4",
-    "mimeType": "video/mp4"
+    "fileName": "large-doc.pdf",
+    "mimeType": "application/pdf"
   }
 }
 ```
@@ -365,36 +445,46 @@ POST /api/files/presign/download/:id
 
 ## 错误响应格式
 
-所有错误返回统一格式：
+普通错误返回统一格式：
 
 ```json
 { "error": "错误描述信息" }
+```
+
+配额类错误返回结构化对象（见上传接口的 429 示例）：
+
+```json
+{ "error": { "code": "...", "message": "...", ... } }
 ```
 
 | 状态码 | 含义 |
 |--------|------|
 | 400 | 请求参数错误 |
 | 401 | 未认证或 token 无效/过期 |
-| 404 | 文件不存在 |
+| 404 | 资源不存在 |
+| 415 | 文件格式不支持 |
+| 429 | 存储配额 / AI 用量配额超限 |
 | 500 | 服务器内部错误 |
-| 503 | Appwrite 认证服务不可用 |
+| 502 | 依赖服务（OCR / 用量）不可用 |
+| 503 | Appwrite 认证服务 / AI 服务不可用 |
 
 ---
 
-## 桌面客户端集成要点
+## 桌面客户端集成要点（文件模块）
 
 1. 用户登录后调用 Appwrite 的 `CreateJWT()` 获取 token
 2. 将 token 存储在本地
 3. 每次 API 请求携带 `Authorization: Bearer <token>`
 4. JWT 过期后需重新调用 `CreateJWT()` 刷新
-5. 小文件（≤100MB）直接 POST 到 `/api/files/upload`
-6. 大文件（>100MB）先请求预签名 URL，再 PUT 直传
+5. 小文件（≤100MB）直接 POST 到 `/api/files/upload`（原始文档直传，无需转码）
+6. 大文件（>100MB）先请求预签名 URL，PUT 直传后**必须**调 `/presign/confirm/:fileId`
+7. 上传前可先调 `GET /api/files/quota` 预判配额
 
 ---
 
 ## We Quiz API
 
-We Quiz 模块管理结构化题目、作答记录和艾宾浩斯复习调度，以 **Quiz** 为聚合根（Document 1:1 Quiz，Quiz 1:N Questions）。
+We Quiz 模块管理结构化题目、作答记录和毕业判定，以 **Quiz** 为聚合根（Document 1:1 Quiz，Quiz 1:N Questions）。
 
 ### 认证方式
 
@@ -416,30 +506,31 @@ Document (files 表) ──1:1── Quiz (quizzes 表) ──1:N── Question
 ```
 
 - **Quiz**：一次出题的持久化结果。创建 session 时同步创建，status 随 AI Worker 回调自动流转（`generating` → `completed` / `failed`）
-- **问题**：每道题关联到一个 Quiz，自带 SM-2 调度字段，客户端通过 `quizId` 拉取指定 Quiz 下的题目
-- **已掌握**：SM-2 间隔 ≥ 21 天视为已掌握，Quiz 列表展示掌握进度
+- **问题**：每道题关联到一个 Quiz，自带毕业统计字段（`consecutive_correct` / `graduated`）
+- **毕业判定**：**服务端计算**——连续答对 3 次即毕业（`graduated = 1`，终态，不再降级）。没有艾宾浩斯/SM-2 调度
 
 ---
 
 ### AI 转换完整链路
 
-客户端全程只与本 API 通信，接触不到 AI Worker——AI Worker 没有公网入口，本 API 通过 Service Binding 内部直连它。**服务器只存文本**：PDF / 图片在上传前就由客户端转成文本。
+客户端全程只与本 API 通信，接触不到 AI Worker——AI Worker 没有公网入口，本 API 通过 Service Binding 内部直连它。**原始文档直传**：PDF / DOCX / XLSX / 图片的转换全部由 AI Worker 服务端完成。
 
 ```
-① 客户端本地转码：txt/md 直接通过；带文字层的 PDF 抽取文字；
-                 扫描件 PDF 逐页渲染成 PNG、图片文件 → 走 ② 识别
-② 客户端 → POST /api/quiz/ocr (JWT, 图片 base64) → 本 API 经 Service Binding 调 AI Worker → 返回转录文字
-③ 客户端 → 上传文本（POST /api/files/upload，只接受 txt/md）→ 拿到 fileId
-④ 客户端 → POST /api/quiz/sessions (JWT)        → 后台创建 Quiz + session，获得 quizId
-⑤ 本 API  → Service Binding 调 AI Worker /api/quiz/generate → 传 { ticket, materials: [{ r2Key, mimeType }] }
-⑥ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing，同步更新 quizzes
-⑦ AI Worker → 直接读 R2（r2Key）                 → 获取文本文档
-⑧ AI Worker → 调用生成模型                       → 获得结构化题目
-⑨ AI Worker → POST /api/quiz/questions/batch (ticket) → 入库挂 quizId，quiz 自动标记 completed
-⑩ 客户端 → GET /api/quiz/sessions/:id 轮询状态 → completed 后通过 quizId 拉取题目
+① 客户端 → 上传原始文档（POST /api/files/upload，白名单格式）→ 拿到 fileId
+② 客户端 → POST /api/quiz/sessions (JWT)        → 后台创建 Quiz + session，获得 quizId
+   （触发前做 AI 用量配额检查，超限返回 429 QUOTA_EXCEEDED）
+③ 本 API  → Service Binding 调 AI Worker /api/quiz/generate → 传 { ticket, userId, materials: [{ r2Key, mimeType }] }
+④ AI Worker → PATCH /api/quiz/sessions/:id/status (ticket) → 标记 processing，同步更新 quizzes
+⑤ AI Worker → 直接读 R2（r2Key）→ 格式分诊：
+              文本直读；PDF/DOCX/XLSX 走 toMarkdown；
+              扫描件 PDF 分块抽页图 OCR；图片走 OCR
+⑥ AI Worker → 内容审核（输入侧语料 + 输出侧题目，fail-closed）
+⑦ AI Worker → 调用生成模型（规划 + 分批生成）→ 获得结构化题目
+⑧ AI Worker → POST /api/quiz/questions/batch (ticket) → 入库挂 quizId，quiz 自动标记 completed
+⑨ 客户端 → GET /api/quiz/sessions/:id 轮询状态 → completed 后通过 quizId 拉取题目
 ```
 
-历史遗留的非文本文件（如旧上传的 PDF）仍保存在文件库，但无法发起出题（`POST /api/quiz/sessions` 会返回 415），需要转成文本重新上传。
+失败时 session / quiz 置为 `failed` 并携带 `failReason`（内容审核原因码：`CONTENT_BLOCKED` / `CONTENT_REVIEW_PENDING` / `CONTENT_SCAN_UNAVAILABLE`），客户端可据此展示文案并支持重试。
 
 ---
 
@@ -462,7 +553,7 @@ Authorization: Bearer <jwt>
       "sourceFileId": "file-uuid",
       "sourceFileName": "math-chapter3",
       "totalQuestions": 25,
-      "masteredQuestions": 8,
+      "graduatedQuestions": 8,
       "status": "completed",
       "createdAt": "2026-08-02T10:00:00.000Z",
       "updatedAt": "2026-08-02T10:01:30.000Z"
@@ -471,7 +562,7 @@ Authorization: Bearer <jwt>
 }
 ```
 
-- `masteredQuestions`：SM-2 间隔 ≥ 21 天的题目数（已掌握）
+- `graduatedQuestions`：连续答对 3 次已毕业的题数
 - status：`generating` / `completed` / `failed`
 
 #### 获取单个 Quiz 详情
@@ -507,7 +598,7 @@ DELETE /api/quiz/quizzes/:id
 Authorization: Bearer <jwt>
 ```
 
-级联删除关联的所有题目、作答记录和会话。
+级联删除关联的所有作答记录、题目、会话和 Quiz。
 
 **响应：**
 ```json
@@ -517,15 +608,15 @@ Authorization: Bearer <jwt>
 #### 获取 Quiz 下的题目
 
 ```
-GET /api/quiz/quizzes/:id/questions?due=true&type=single_answer&page=1&limit=20
+GET /api/quiz/quizzes/:id/questions?graduated=false&type=single_answer&page=1&limit=20
 Authorization: Bearer <jwt>
 ```
 
-查询参数同 `GET /api/quiz/questions`，但不需传 `quizId`（已由路径指定）。按 `next_review_at` 升序排列。
+查询参数同 `GET /api/quiz/questions`，但不需传 `quizId`（已由路径指定）。
 
 ---
 
-### 图片转文字（OCR）
+### 图片转文字（OCR，异步）
 
 ```
 POST /api/quiz/ocr
@@ -533,18 +624,30 @@ Authorization: Bearer <jwt>
 Content-Type: application/json
 ```
 
-客户端上传前的转码接口：把扫描件 PDF 的渲染图 / 图片文件转成文字。本接口通过 Service Binding 内部调用 AI Worker（AI Worker 无公网入口），客户端依然接触不到它。
-
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | images | array | 是 | 1~15 项，每项 `{ data: base64, mimeType: image/jpeg/image/png/image/webp }`，单张 ≤4MB |
 
-**响应 (200)：**
+**异步流程**：AI Worker 接收后立即返回 202 和 `taskId`，实际 OCR 由 Durable Object 分批处理，客户端轮询结果。触发前做 AI 用量配额检查。
+
+**响应 (202)：**
 ```json
-{ "data": { "text": "转录出来的文字" } }
+{ "data": { "taskId": "ocr_...", "status": "processing" } }
 ```
 
-**错误：** 400 参数错误 / 422 图片中无可识别文字 / 502 AI 服务不可用。多图时每 5 张一次模型调用，整体可能耗时几分钟，客户端请放宽超时。
+#### 轮询 OCR 结果
+
+```
+GET /api/quiz/ocr/status/:taskId
+Authorization: Bearer <jwt>
+```
+
+**响应：**
+
+- 处理中：`{ "data": { "status": "processing", "progress": { "batch": 1, "total": 3 } } }`
+- 完成：`{ "data": { "status": "done", "text": "转录出来的文字" } }`
+- 失败：`{ "data": { "status": "failed", "error": "..." } }`（500）
+- 图片中无可识别文字：422
 
 ---
 
@@ -583,9 +686,18 @@ curl -X POST https://your-worker.workers.dev/api/quiz/sessions \
 ```
 
 - 同时创建 Quiz 和 session，两者 id 相同（quizId === sessionId）
-- 源文档必须是文本格式（历史遗留的 PDF 等会返回 415，提示转换后重新上传）
+- 源文档格式不在白名单内时返回 415
+- 触发前做 AI 用量配额检查，超限返回 429（`code: QUOTA_EXCEEDED`）
 - 若 AI Worker 触发失败，Quiz 和 session 会被自动清理并返回 503 `AI 服务暂时不可用，请稍后重试`
-- session 有效期 30 分钟，用 `quizId` 通过下方"查询 Session 状态"接口轮询进度
+- session 有效期 30 分钟（长任务中 AI Worker 会自动续期），用 `quizId` 通过下方"查询 Session 状态"接口轮询进度
+
+**重试语义**（同一文档再次调用时）：
+
+| 已有 Quiz 状态 | 行为 |
+|----------------|------|
+| `generating` | 直接返回已有 quizId（200），不重复触发 |
+| `completed` | 直接返回已有 quizId（200） |
+| `failed` | 清理残留题目 → 重置为 `generating` → 新建 session → 重新触发 AI |
 
 ---
 
@@ -596,7 +708,7 @@ GET /api/quiz/sessions/:id
 Authorization: Bearer <jwt>
 ```
 
-**响应：**
+**响应（session 存在）：**
 ```json
 {
   "data": {
@@ -604,6 +716,7 @@ Authorization: Bearer <jwt>
     "sessionId": "a1b2c3d4-...",
     "sourceFileId": "file-uuid",
     "status": "completed",
+    "failReason": null,
     "createdAt": "2026-08-02T10:00:00.000Z",
     "completedAt": "2026-08-02T10:01:30.000Z",
     "expiresAt": "2026-08-02T10:30:00.000Z"
@@ -612,7 +725,25 @@ Authorization: Bearer <jwt>
 ```
 
 status 取值：`pending` → `processing` → `completed` / `failed`
-- session 过期清理后仍可通过 quizId 查到 Quiz 状态（响应不含 sessionId 和 expiresAt）
+
+- `failReason`：仅 failed 时非空，取值 `CONTENT_BLOCKED` / `CONTENT_REVIEW_PENDING` / `CONTENT_SCAN_UNAVAILABLE`
+- session 过期清理后仍可通过 quizId 查到 Quiz 状态（响应只含 `quizId`、`sourceFileName`、`status`、`failReason`、`createdAt`）
+
+---
+
+### 取消出题任务
+
+```
+POST /api/quiz/sessions/:id/cancel
+Authorization: Bearer <jwt>
+```
+
+仅 `pending` / `processing` 状态可取消（其他状态返回 409）。将 session 和 quiz 置为 `failed`，AI Worker 下次续期 ticket 时收到 4xx 即中止。
+
+**响应：**
+```json
+{ "data": { "sessionId": "...", "status": "failed" } }
+```
 
 ---
 
@@ -627,6 +758,20 @@ Content-Type: application/json
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | status | string | 是 | `processing` / `completed` / `failed` |
+| reason | string | 否 | 仅 `failed` 时可携带，限 `CONTENT_BLOCKED` / `CONTENT_REVIEW_PENDING` / `CONTENT_SCAN_UNAVAILABLE` |
+
+同步更新 quiz_sessions 与 quizzes 两张表。
+
+---
+
+### 续期 Ticket（AI Worker 用）
+
+```
+POST /api/quiz/sessions/:id/renew
+X-Quiz-Ticket: <ticket>
+```
+
+将 `expires_at` 往后推 30 分钟，防止长时生成任务中途过期。已取消/已完成的 session 返回 4xx（AI Worker 据此检测取消信号并中止）。
 
 ---
 
@@ -651,7 +796,8 @@ Content-Type: application/json
 | answer | object | 是 | 正确答案（JSON） |
 | tags | string[] | 否 | 标签 |
 
-**请求示例：**
+五种题型（`single_answer` 单选、`multiple_answer` 多选、`true_false` 判断、`fill_blank` 填空、`short_answer` 简答）：
+
 ```json
 {
   "questions": [
@@ -659,7 +805,7 @@ Content-Type: application/json
       "type": "single_answer",
       "content": { "stem": "2+2等于?", "options": ["3", "4", "5", "6"] },
       "answer": { "correctIndex": 1 },
-      "tags": ["数学", "基础运算"]
+      "tags": ["数学"]
     },
     {
       "type": "true_false",
@@ -669,7 +815,7 @@ Content-Type: application/json
     {
       "type": "fill_blank",
       "content": { "stem": "法国的首都是___" },
-      "answer": { "correct": "巴黎", "accept": ["巴黎", "Paris"] }
+      "answer": { "correct": ["巴黎"], "accept": [["巴黎", "Paris"]] }
     }
   ]
 }
@@ -692,7 +838,7 @@ Content-Type: application/json
 ### 获取题目列表
 
 ```
-GET /api/quiz/questions?quizId=xxx&due=true&page=1&limit=20
+GET /api/quiz/questions?quizId=xxx&graduated=false&page=1&limit=20
 Authorization: Bearer <jwt>
 ```
 
@@ -700,7 +846,7 @@ Authorization: Bearer <jwt>
 |------|------|------|------|
 | quizId | string | - | 按 Quiz 过滤 |
 | tags | string | - | 逗号分隔标签（匹配任一） |
-| due | boolean | false | 只返回到期题目（next_review_at ≤ 当前时间） |
+| graduated | string | - | `true` 只返回已毕业，`false` 只返回未毕业，不传返回全部 |
 | type | string | - | 按题型过滤 |
 | page | number | 1 | 页码 |
 | limit | number | 50 | 每页数量（最大 200） |
@@ -717,12 +863,9 @@ Authorization: Bearer <jwt>
         "content": { "stem": "2+2等于?", "options": ["3", "4", "5", "6"] },
         "answer": { "correctIndex": 1 },
         "tags": ["数学"],
-        "schedule": {
-          "easeFactor": 2.5,
-          "interval": 0,
-          "repetitions": 0,
-          "nextReviewAt": "2026-08-02T10:00:00.000Z",
-          "lastReviewedAt": null
+        "stats": {
+          "consecutiveCorrect": 0,
+          "graduated": 0
         },
         "createdAt": "2026-08-02T10:00:00.000Z",
         "updatedAt": "2026-08-02T10:00:00.000Z"
@@ -736,8 +879,6 @@ Authorization: Bearer <jwt>
 ```
 
 也可以使用 `GET /api/quiz/quizzes/:id/questions` 按指定 Quiz 拉取题目。
-
-**离线刷题建议**：客户端联网时用 `?quizId=xxx&due=true&limit=20` 拉取一批到期题目缓存到本地，离线时本地出题，联网后同步作答结果。
 
 ---
 
@@ -768,7 +909,7 @@ Authorization: Bearer <jwt>
 
 ---
 
-### 提交作答记录 + 更新调度
+### 提交作答记录（服务端算毕业）
 
 ```
 POST /api/quiz/answers
@@ -786,39 +927,14 @@ Content-Type: application/json
 |------|------|------|------|
 | questionId | string | 是 | 题目 ID |
 | isCorrect | boolean | 是 | 是否答对 |
-| userAnswer | any | 否 | 用户的实际答案（JSON） |
-| newSchedule | object | 是 | 客户端计算的新调度状态 |
-| newSchedule.easeFactor | number | 是 | 新难度系数 |
-| newSchedule.interval | number | 是 | 新间隔天数 |
-| newSchedule.repetitions | number | 是 | 新连续答对次数 |
-| newSchedule.nextReviewAt | string | 是 | 新下次复习时间（ISO） |
+| userAnswer | any | 否 | 用户的实际答案（JSON，仅审计记录用） |
 
 **请求示例：**
 ```json
 {
   "answers": [
-    {
-      "questionId": "uuid-1",
-      "isCorrect": true,
-      "userAnswer": { "selectedIndex": 1 },
-      "newSchedule": {
-        "easeFactor": 2.6,
-        "interval": 1,
-        "repetitions": 1,
-        "nextReviewAt": "2026-08-03T10:00:00.000Z"
-      }
-    },
-    {
-      "questionId": "uuid-2",
-      "isCorrect": false,
-      "userAnswer": { "selectedIndex": 0 },
-      "newSchedule": {
-        "easeFactor": 2.3,
-        "interval": 0,
-        "repetitions": 0,
-        "nextReviewAt": "2026-08-02T10:10:00.000Z"
-      }
-    }
+    { "questionId": "uuid-1", "isCorrect": true, "userAnswer": { "selectedIndex": 1 } },
+    { "questionId": "uuid-2", "isCorrect": false, "userAnswer": { "selectedIndex": 0 } }
   ]
 }
 ```
@@ -828,17 +944,45 @@ Content-Type: application/json
 { "data": { "recorded": 2 } }
 ```
 
-**调度说明**：Worker 不计算艾宾浩斯算法，只负责存储。客户端答完题后本地运行 SM-2（或 FSRS）公式，将计算结果通过此接口同步到服务端。
+**毕业判定（服务端完成）**：每题答对 `consecutive_correct` +1，答错归 0；连续答对满 3 次标记 `graduated = 1`（终态，已毕业不再降级）。客户端**不需要**计算任何调度算法，也**不传**调度字段。
+
+---
+
+## 用量查询
+
+```
+GET /usage?ym=YYYY-MM（可选，默认本月，北京时间自然月）
+Authorization: Bearer <jwt>
+```
+
+返回当前用户指定月份的 AI 用量（聚合在 AI Worker 完成，查 AI Gateway 日志）。userId 取自 JWT，客户端无法查询他人。
+
+**响应：**
+```json
+{
+  "data": {
+    "month": "2026-08",
+    "requests": 42,
+    "cost": 0.123456,
+    "tokensIn": 120000,
+    "tokensOut": 35000
+  }
+}
+```
+
+- `cost` 单位 USD
+- AI 用量配额检查（`POST /api/quiz/sessions` 与 `POST /api/quiz/ocr` 触发前）：当月 `cost` ≥ 订阅 `quotaLimit` 时返回 429（`code: QUOTA_EXCEEDED`）；订阅缺失时回退免费额度 0.5 USD
 
 ---
 
 ## We Quiz 桌面客户端集成要点
 
-1. 上传文档用 `Documents.UploadDocumentAsync`：txt/md 直传，带文字层的 PDF 自动抽取文字，扫描件 PDF 与图片自动走 `POST /api/quiz/ocr` 识别后以文本上传（服务器只接受文本）
+1. 上传文档用 `POST /api/files/upload`：白名单格式（txt / md / PDF / docx / xlsx / jpg / png / webp）原始直传，**客户端无需转码**
 2. 出题只需调 `POST /api/quiz/sessions`（传 sourceFileId），服务端会自动创建 Quiz 并触发 AI Worker，响应含 quizId
-3. 通过 `GET /api/quiz/sessions/:id` 轮询转换进度，completed 后 Quiz 即就绪
-4. 客户端不需要知道 AI Worker 的存在，ticket / r2Key / 内部令牌均为服务端内部凭证
-5. 通过 `GET /api/quiz/quizzes` 查看所有 Quiz 及学习进度
-6. 刷题时调 `GET /api/quiz/quizzes/:id/questions?due=true&limit=N` 拉取指定 Quiz 的到期题目
-7. 离线时本地缓存题目和调度状态，联网后通过 `POST /api/quiz/answers` 批量同步
-8. 调度算法（SM-2/FSRS）完全在客户端实现，服务端只存状态
+3. 通过 `GET /api/quiz/sessions/:id` 轮询转换进度，completed 后 Quiz 即就绪；failed 时读 `failReason` 展示文案，可直接重新调 `POST /api/quiz/sessions` 重试
+4. 进行中可用 `POST /api/quiz/sessions/:id/cancel` 取消
+5. 客户端不需要知道 AI Worker 的存在，ticket / r2Key / 内部令牌均为服务端内部凭证
+6. 通过 `GET /api/quiz/quizzes` 查看所有 Quiz 及毕业进度（`graduatedQuestions` / `totalQuestions`）
+7. 刷题时调 `GET /api/quiz/quizzes/:id/questions?graduated=false&limit=N` 拉取未毕业题目
+8. 作答后调 `POST /api/quiz/answers` 批量提交（只传 questionId / isCorrect / userAnswer），毕业判定由服务端完成
+9. 独立 OCR 需求（如上传前预览识别效果）走 `POST /api/quiz/ocr` + `GET /api/quiz/ocr/status/:taskId` 异步轮询

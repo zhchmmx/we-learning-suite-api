@@ -10,7 +10,7 @@ import { authMiddleware } from '../auth';
 const usage = new Hono<AppEnv>();
 
 /**
- * GET /api/usage?ym=YYYY-MM（可选，默认本月，北京时间自然月）
+ * GET /usage?ym=YYYY-MM（可选，默认本月，北京时间自然月）
  * 返回：{ data: { month, requests, cost(USD), tokensIn, tokensOut } }
  */
 usage.get('/', authMiddleware, async (c) => {
