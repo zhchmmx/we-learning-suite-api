@@ -63,6 +63,13 @@ export interface ListFilesResponse {
 	limit: number;
 }
 
+/** 存储配额查询响应（GET /api/files/quota） */
+export interface StorageQuotaResponse {
+	usedBytes: number;
+	quotaLimitBytes: number;
+	remainingBytes: number;
+}
+
 export interface PresignUploadResponse {
 	uploadUrl: string;
 	fileId: string;

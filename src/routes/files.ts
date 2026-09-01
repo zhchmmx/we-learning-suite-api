@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
-import type { AppEnv, FileRecord, FileMetadataResponse, ListFilesResponse } from '../types';
+import type { AppEnv, FileRecord, FileMetadataResponse, ListFilesResponse, StorageQuotaResponse } from '../types';
 import { generatePresignedUrl } from '../services/presign';
+import { checkStorageQuota, getStorageQuotaLimit, getStorageUsageBytes } from '../services/storage-quota';
 import { stripExtension, restoreExtension } from '../utils/filename';
 
 const files = new Hono<AppEnv>();
@@ -10,23 +11,17 @@ const BUCKET_NAME = 'we-learning-suite';
 // ===== 上传格式白名单 =====
 
 /**
- * 服务器接受原始文档直传：文本、PDF、Office/开放文档、HTML/CSV 与常见图片。
+ * 服务器接受原始文档直传：文本、PDF/DOCX/XLSX 与常见图片。
  * 非文本格式在出题时由 AI Worker 服务端转换（AI.toMarkdown）或 OCR，客户端无需转码。
- * PPTX / 老式 .doc/.ppt 不支持（转换服务不覆盖）。
+ * 与 AI Worker 出题管线的格式支持严格对齐（xls / odt / ods / html / xml / csv 等不支持）。
  */
 const ALLOWED_UPLOAD_MIME_TYPES = new Set([
 	// 文本（向后兼容旧客户端）
 	'text/plain', 'text/markdown', 'text/x-markdown',
-	// 文档
+	// 文档（仅 AI Worker 出题管线支持：AI.toMarkdown 转换）
 	'application/pdf',
 	'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
 	'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // xlsx
-	'application/vnd.ms-excel', // xls
-	'application/vnd.oasis.opendocument.text', // odt
-	'application/vnd.oasis.opendocument.spreadsheet', // ods
-	'text/html',
-	'application/xml',
-	'text/csv',
 	// 图片（出题时走服务端 OCR 通道）
 	'image/jpeg', 'image/png', 'image/webp',
 ]);
@@ -37,7 +32,7 @@ export function isAllowedUploadMime(mimeType: string): boolean {
 }
 
 const UPLOAD_FORMAT_ERROR =
-	'不支持的文件格式。当前支持：txt / markdown / PDF / docx / xlsx / odt / ods / html / xml / csv / jpg / png / webp（不支持 PPT、PPTX）';
+	'不支持的文件格式。当前支持：txt / markdown / PDF / docx / xlsx / jpg / png / webp';
 
 // ===== 工具函数 =====
 
@@ -104,6 +99,7 @@ files.post('/upload', async (c) => {
 	let fileName: string;
 	let mimeType: string;
 	let targetPath: string;
+	let requestedBytes: number | null;
 
 	if (contentType.includes('multipart/form-data')) {
 		// multipart 表单上传
@@ -118,6 +114,7 @@ files.post('/upload', async (c) => {
 		fileName = (formData.get('name') as string) || file.name;
 		mimeType = file.type || 'application/octet-stream';
 		targetPath = normalizePath((formData.get('path') as string) || '/');
+		requestedBytes = file.size;
 	} else {
 		// 原始二进制流上传（客户端直接 PUT/POST body）
 		fileBody = c.req.raw.body as ReadableStream;
@@ -128,6 +125,10 @@ files.post('/upload', async (c) => {
 		if (!fileBody) {
 			return c.json({ error: 'Empty request body' }, 400);
 		}
+
+		// 流式 body 大小只能依赖 Content-Length；缺失时跳过配额检查（fail-open）
+		const contentLength = parseInt(c.req.header('content-length') || '', 10);
+		requestedBytes = Number.isNaN(contentLength) ? null : contentLength;
 	}
 
 	// 验证文件名
@@ -138,6 +139,25 @@ files.post('/upload', async (c) => {
 	// 格式白名单校验（不在名单内的格式直接拒绝）
 	if (!isAllowedUploadMime(mimeType)) {
 		return c.json({ error: UPLOAD_FORMAT_ERROR }, 415);
+	}
+
+	// 存储配额检查：已用 + 待上传 > 上限时拒绝（requestedBytes 未知时跳过，fail-open）
+	if (requestedBytes != null && requestedBytes > 0) {
+		const quota = await checkStorageQuota(c, requestedBytes);
+		if (quota && !quota.allowed) {
+			return c.json(
+				{
+					error: {
+						code: 'STORAGE_QUOTA_EXCEEDED',
+						message: 'Storage quota exceeded',
+						quotaLimitBytes: quota.quotaLimitBytes,
+						currentUsageBytes: quota.currentUsageBytes,
+						requestedBytes: quota.requestedBytes,
+					},
+				},
+				429
+			);
+		}
 	}
 
 	// 生成文件 ID 和 R2 key
@@ -226,6 +246,29 @@ files.get('/', async (c) => {
 	};
 
 	return c.json({ data: response });
+});
+
+/**
+ * GET /quota
+ * 查询当前用户的存储配额与用量（字节）
+ *
+ * ⚠️ 必须注册在 GET /:id 之前，否则 "quota" 会被当作 :id 参数匹配。
+ */
+files.get('/quota', async (c) => {
+	const userId = c.get('userId');
+
+	const [quotaLimitBytes, usedBytes] = await Promise.all([
+		getStorageQuotaLimit(c),
+		getStorageUsageBytes(c.env.DB, userId),
+	]);
+
+	const data: StorageQuotaResponse = {
+		usedBytes,
+		quotaLimitBytes,
+		remainingBytes: Math.max(0, quotaLimitBytes - usedBytes),
+	};
+
+	return c.json({ data });
 });
 
 /**
@@ -509,6 +552,23 @@ files.post('/presign/upload', async (c) => {
 	// 格式白名单校验（与 /upload 一致）
 	if (!isAllowedUploadMime(mimeType)) {
 		return c.json({ error: UPLOAD_FORMAT_ERROR }, 415);
+	}
+
+	// 存储配额检查：已用 + 声明大小 > 上限时拒绝（预签名直传在签发前拦截）
+	const quota = await checkStorageQuota(c, body.size);
+	if (quota && !quota.allowed) {
+		return c.json(
+			{
+				error: {
+					code: 'STORAGE_QUOTA_EXCEEDED',
+					message: 'Storage quota exceeded',
+					quotaLimitBytes: quota.quotaLimitBytes,
+					currentUsageBytes: quota.currentUsageBytes,
+					requestedBytes: quota.requestedBytes,
+				},
+			},
+			429
+		);
 	}
 
 	const fileId = crypto.randomUUID();
