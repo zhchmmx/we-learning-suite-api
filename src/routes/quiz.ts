@@ -743,13 +743,20 @@ quiz.get('/ocr/status/:taskId', authMiddleware, async (c) => {
 /**
  * POST /questions/batch
  * AI Worker 批量上传题目（需要 ticket 认证）
- * 入库时挂 quiz_id，同时更新 quizzes 状态为 completed
+ * 支持分片上传：题目总数 > MAX_BATCH_SIZE 时由 AI Worker 切片多次调用。
+ * - offset：本片第一题的全局序号（用于生成确定性 id，实现分片幂等——重发不产生重复行）
+ * - final：仅最后一片为 true；只有 final 片才把 quizzes / session 置 completed
+ * 两者缺省时保持旧行为（单片上传、立即 completed），向后兼容。
  */
 quiz.post('/questions/batch', ticketAuthMiddleware, async (c) => {
 	const userId = c.get('userId');
 	const sessionId = c.get('sessionId');
 
-	let body: { questions: Array<{ type: string; content: unknown; answer: unknown; tags?: string[] }> };
+	let body: {
+		questions: Array<{ type: string; content: unknown; answer: unknown; tags?: string[] }>;
+		offset?: unknown;
+		final?: unknown;
+	};
 	try {
 		body = await c.req.json();
 	} catch {
@@ -768,22 +775,26 @@ quiz.post('/questions/batch', ticketAuthMiddleware, async (c) => {
 		return c.json({ error: `Maximum ${MAX_BATCH_SIZE} questions per batch` }, 400);
 	}
 
+	// offset：合法的非负整数才启用确定性 id；final：仅显式 false 才视为非末片
+	const offset = typeof body.offset === 'number' && Number.isInteger(body.offset) && body.offset >= 0
+		? body.offset
+		: null;
+	const isFinal = body.final !== false;
+
 	// session_id 即 quiz_id
 	const quizId = sessionId;
 	const now = new Date().toISOString();
 
-	// 批量插入
-	const insertedIds: string[] = [];
-	const statements = body.questions.map((q) => {
-		const id = crypto.randomUUID();
-		insertedIds.push(id);
-
+	// 批量插入：确定性 id（quizId-全局序号）+ INSERT OR IGNORE → 分片重发幂等。
+	// D1 batch 是事务：任一语句失败整片回滚，不存在半片状态。
+	const statements = body.questions.map((q, i) => {
 		if (!q.type || !q.content || !q.answer) {
 			return null;
 		}
+		const id = offset === null ? crypto.randomUUID() : `${quizId}-${offset + i}`;
 
 		return c.env.DB.prepare(
-			`INSERT INTO questions (id, user_id, quiz_id, type, content, answer, tags, created_at, updated_at)
+			`INSERT OR IGNORE INTO questions (id, user_id, quiz_id, type, content, answer, tags, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		).bind(
 			id, userId, quizId,
@@ -803,16 +814,19 @@ quiz.post('/questions/batch', ticketAuthMiddleware, async (c) => {
 
 	await c.env.DB.batch(validStatements);
 
-	// 更新 quiz 状态为 completed，同步更新 session
-	await c.env.DB.batch([
-		c.env.DB.prepare(`UPDATE quizzes SET status = 'completed', updated_at = ? WHERE id = ?`).bind(now, quizId),
-		c.env.DB.prepare(`UPDATE quiz_sessions SET status = 'completed', completed_at = ? WHERE id = ?`).bind(now, sessionId),
-	]);
+	// 只有最后一片才置 completed——中间片失败时 session 仍可重试 / 可复活（API 重试路径会清库重传）
+	if (isFinal) {
+		await c.env.DB.batch([
+			c.env.DB.prepare(`UPDATE quizzes SET status = 'completed', updated_at = ? WHERE id = ?`).bind(now, quizId),
+			c.env.DB.prepare(`UPDATE quiz_sessions SET status = 'completed', completed_at = ? WHERE id = ?`).bind(now, sessionId),
+		]);
+	}
 
 	return c.json({
 		data: {
 			inserted: validStatements.length,
 			quizId,
+			final: isFinal,
 		},
 	}, 201);
 });
