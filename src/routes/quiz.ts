@@ -37,6 +37,8 @@ interface QuizSessionRecord {
 	created_at: string;
 	completed_at: string | null;
 	fail_reason: string | null;
+	/** 细粒度生成进度（JSON 字符串：{ phase, done, total, updatedAt }），AI Worker 随 renew 上报 */
+	progress: string | null;
 }
 
 // ===== 辅助函数 =====
@@ -345,62 +347,79 @@ quiz.post('/sessions', authMiddleware, quotaCheckMiddleware, async (c) => {
 			});
 		}
 
-		// ── failed：清理残留 → 重置状态 → 新建 session → 重新触发 AI ──
-		if (existingQuiz.status === 'failed') {
-			const now = new Date();
-			const expiresAt = new Date(now.getTime() + TICKET_TTL_SECONDS * 1000);
-			const newSessionId = crypto.randomUUID();
+	// ── failed：复活原 session（同 ticket）→ 触发 AI Worker 断点续传 ──
+	// 关键：ticket 必须保持 == quiz.id == 原 session.id，
+	// AI Worker 的 DO 以 idFromName(ticket) 寻址，同 ticket 才能找回持有
+	// 生成检查点（已生成的批次、corpus）的旧 DO 实例，实现续传而非重头再来。
+	if (existingQuiz.status === 'failed') {
+		const now = new Date();
+		const expiresAt = new Date(now.getTime() + TICKET_TTL_SECONDS * 1000);
 
-			try {
-				// 清理上次可能残留的题目 + 重置 quiz 状态 + 创建新 session
-				await c.env.DB.batch([
-					c.env.DB.prepare(`DELETE FROM questions WHERE quiz_id = ?`).bind(existingQuiz.id),
-					c.env.DB.prepare(`UPDATE quizzes SET status = 'generating', updated_at = ?, fail_reason = NULL WHERE id = ?`)
-						.bind(now.toISOString(), existingQuiz.id),
-					c.env.DB.prepare(
-						`INSERT INTO quiz_sessions (id, user_id, quiz_id, source_file_id, status, expires_at, created_at)
-						 VALUES (?, ?, ?, ?, 'pending', ?, ?)`
-					).bind(newSessionId, userId, existingQuiz.id, body.sourceFileId, expiresAt.toISOString(), now.toISOString()),
-				]);
-			} catch (err) {
-				console.error('DB error during quiz retry:', err);
-				return c.json({ error: '数据库异常，请稍后重试' }, 500);
+		try {
+			// 1. 清理上次可能残留的题目（防御：上传阶段中途失败可能留下半量数据）
+			await c.env.DB.prepare(`DELETE FROM questions WHERE quiz_id = ?`).bind(existingQuiz.id).run();
+
+			// 2. 复活原 session 行（而非新建）：status 回 pending、票期重置、进度清零。
+			//    行不存在（被清理过）时按原 id 补建，保持 ticket == session id 不变量。
+			const revived = await c.env.DB.prepare(
+				`UPDATE quiz_sessions
+				   SET status = 'pending', expires_at = ?, completed_at = NULL, fail_reason = NULL, progress = NULL
+				 WHERE id = ? AND user_id = ?`
+			).bind(expiresAt.toISOString(), existingQuiz.id, userId).run();
+
+			if (revived.meta.changes === 0) {
+				await c.env.DB.prepare(
+					`INSERT INTO quiz_sessions (id, user_id, quiz_id, source_file_id, status, expires_at, created_at)
+					 VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+				).bind(existingQuiz.id, userId, existingQuiz.id, body.sourceFileId, expiresAt.toISOString(), now.toISOString()).run();
 			}
 
-			// 重新触发 AI Worker
-			let triggerOk = false;
-			try {
-				const triggerRes = await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/quiz/generate', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						ticket: existingQuiz.id,
-						userId,
-						materials: [{ r2Key: file.r2_key, mimeType: file.mime_type }],
-					}),
-					signal: AbortSignal.timeout(15000),
-				});
-				triggerOk = triggerRes.ok;
-			} catch {
-				triggerOk = false;
-			}
-
-			if (!triggerOk) {
-				// 触发失败：只清理新 session，quiz 保持 failed
-				await c.env.DB.prepare(`DELETE FROM quiz_sessions WHERE id = ?`).bind(newSessionId).run();
-				return c.json({ error: 'AI 服务暂时不可用，请稍后重试' }, 503);
-			}
-
-			return c.json({
-				data: {
-					quizId: existingQuiz.id,
-					sessionId: newSessionId,
-					sourceFileName: stripExtension(file.name),
-					status: 'generating',
-					expiresIn: TICKET_TTL_SECONDS,
-				},
-			});
+			// 3. 重置 quiz 状态
+			await c.env.DB.prepare(`UPDATE quizzes SET status = 'generating', updated_at = ?, fail_reason = NULL WHERE id = ?`)
+				.bind(now.toISOString(), existingQuiz.id).run();
+		} catch (err) {
+			console.error('DB error during quiz retry:', err);
+			return c.json({ error: '数据库异常，请稍后重试' }, 500);
 		}
+
+		// 4. 重新触发 AI Worker（ticket = quiz id，与复活后的 session id 一致）
+		let triggerOk = false;
+		try {
+			const triggerRes = await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/quiz/generate', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					ticket: existingQuiz.id,
+					userId,
+					materials: [{ r2Key: file.r2_key, mimeType: file.mime_type }],
+				}),
+				signal: AbortSignal.timeout(15000),
+			});
+			triggerOk = triggerRes.ok;
+		} catch {
+			triggerOk = false;
+		}
+
+		if (!triggerOk) {
+			// 触发失败：session / quiz 回退 failed（DO 检查点仍在，下次重试仍可续传）
+			await c.env.DB.batch([
+				c.env.DB.prepare(`UPDATE quiz_sessions SET status = 'failed' WHERE id = ?`).bind(existingQuiz.id),
+				c.env.DB.prepare(`UPDATE quizzes SET status = 'failed', updated_at = ? WHERE id = ?`)
+					.bind(new Date().toISOString(), existingQuiz.id),
+			]);
+			return c.json({ error: 'AI 服务暂时不可用，请稍后重试' }, 503);
+		}
+
+		return c.json({
+			data: {
+				quizId: existingQuiz.id,
+				sessionId: existingQuiz.id,
+				sourceFileName: stripExtension(file.name),
+				status: 'generating',
+				expiresIn: TICKET_TTL_SECONDS,
+			},
+		});
+	}
 	}
 
 	// ── 全新创建 ──
@@ -505,6 +524,16 @@ quiz.get('/sessions/:id', authMiddleware, async (c) => {
 		});
 	}
 
+	// 进度快照（细粒度）：旧数据 / 尚未开始上报时为 null，客户端按 status 降级展示
+	let progress: unknown = null;
+	if (session.progress) {
+		try {
+			progress = JSON.parse(session.progress);
+		} catch {
+			// 脏数据容错：当作无进度
+		}
+	}
+
 	return c.json({
 		data: {
 			quizId: session.quiz_id,
@@ -512,6 +541,7 @@ quiz.get('/sessions/:id', authMiddleware, async (c) => {
 			sourceFileId: session.source_file_id,
 			status: session.status,
 			failReason: session.fail_reason ?? null,
+			progress,
 			createdAt: session.created_at,
 			completedAt: session.completed_at,
 			expiresAt: session.expires_at,
@@ -579,12 +609,31 @@ quiz.post('/sessions/:id/renew', ticketAuthMiddleware, async (c) => {
 		return c.json({ error: 'Ticket does not match this session' }, 403);
 	}
 
+	// 可选进度载荷（AI Worker 随续期上报）：解析失败/缺失时静默忽略、仅续期。
+	// ⚠️ renew 绝不能因进度数据返回 4xx/5xx——DO 将 4xx 视为"取消信号"会直接终止任务。
+	let progressJson: string | null = null;
+	try {
+		const body = await c.req.json();
+		const p = body?.progress;
+		const PROGRESS_PHASES = ['planning', 'scanning', 'generating', 'uploading'];
+		if (p && typeof p === 'object' && PROGRESS_PHASES.includes(p.phase)) {
+			progressJson = JSON.stringify({
+				phase: p.phase,
+				done: typeof p.done === 'number' && p.done >= 0 ? Math.floor(p.done) : undefined,
+				total: typeof p.total === 'number' && p.total >= 0 ? Math.floor(p.total) : undefined,
+				updatedAt: new Date().toISOString(),
+			});
+		}
+	} catch {
+		// 无 body / 非 JSON：仅续期
+	}
+
 	const now = new Date();
 	const expiresAt = new Date(now.getTime() + TICKET_TTL_SECONDS * 1000);
 
 	await c.env.DB
-		.prepare(`UPDATE quiz_sessions SET expires_at = ? WHERE id = ?`)
-		.bind(expiresAt.toISOString(), sessionId)
+		.prepare(`UPDATE quiz_sessions SET expires_at = ?, progress = COALESCE(?, progress) WHERE id = ?`)
+		.bind(expiresAt.toISOString(), progressJson, sessionId)
 		.run();
 
 	return c.json({ data: { sessionId, expiresAt: expiresAt.toISOString() } });
