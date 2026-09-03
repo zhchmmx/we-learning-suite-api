@@ -584,13 +584,18 @@ quiz.patch('/sessions/:id/status', ticketAuthMiddleware, async (c) => {
 	const completedAt = body.status === 'completed' || body.status === 'failed' ? new Date().toISOString() : null;
 	const now = new Date().toISOString();
 
+	// session 与 quiz 是两套状态词表（0005_quizzes.sql:63 vs :14）：
+	// session 说"正在干活"用 processing，quiz 侧同一个事实叫 generating。
+	// 直接抄会让 quizzes.status 落入清单外的值，使 :326 的复用分支永久不可达。
+	const quizStatus = body.status === 'processing' ? 'generating' : body.status;
+
 	// 同步更新 session 和 quiz 状态
 	await c.env.DB.batch([
 		c.env.DB.prepare(
 			`UPDATE quiz_sessions SET status = ?, completed_at = COALESCE(?, completed_at), fail_reason = ? WHERE id = ?`
 		).bind(body.status, completedAt, failReason, sessionId),
 		c.env.DB.prepare(`UPDATE quizzes SET status = ?, updated_at = ?, fail_reason = ? WHERE id = ?`)
-			.bind(body.status, now, failReason, sessionId),
+			.bind(quizStatus, now, failReason, sessionId),
 	]);
 
 	return c.json({ data: { sessionId, quizId: sessionId, status: body.status, failReason } });
