@@ -950,6 +950,8 @@ Content-Type: application/json
 
 ## 用量查询
 
+### 兼容接口（旧客户端）
+
 ```
 GET /usage?ym=YYYY-MM（可选，默认本月，北京时间自然月）
 Authorization: Bearer <jwt>
@@ -972,6 +974,32 @@ Authorization: Bearer <jwt>
 
 - `cost` 单位 USD
 - AI 用量配额检查（`POST /api/quiz/sessions` 与 `POST /api/quiz/ocr` 触发前）：当月 `cost` ≥ 订阅 `quotaLimit` 时返回 429（`code: QUOTA_EXCEEDED`）；订阅缺失时回退免费额度 0.5 USD
+
+### 百分比接口（新客户端，推荐）
+
+```
+GET /usage/v2?ym=YYYY-MM（可选，默认本月，北京时间自然月）
+Authorization: Bearer <jwt>
+```
+
+后端统一计算用量百分比并作为**唯一权威源**返回，客户端**不要**自行计算（避免各端展示不一致）。不对外暴露美元金额。
+
+**响应：**
+```json
+{
+  "data": {
+    "month": "2026-09",
+    "requests": 42,
+    "tokensIn": 120000,
+    "tokensOut": 35000,
+    "usagePercent": 12.3,
+    "remainingPercent": 87.7
+  }
+}
+```
+
+- `usagePercent` / `remainingPercent` 已 clamp 到 0~100，统一保留 1 位小数
+- 计算口径：`usagePercent = min(cost / quotaLimit × 100, 100)`，`quotaLimit` 取订阅值，订阅缺失时回退免费额度 0.5 USD
 
 ---
 
