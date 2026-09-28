@@ -443,6 +443,87 @@ POST /api/files/presign/download/:id
 
 ---
 
+### 文件同步
+
+```
+POST /api/files/sync/check
+```
+
+批量比对本地和服务端的文件列表，返回需要上传和下载的文件。
+
+**请求体：**
+```json
+{
+  "files": [
+    { "id": "xxx", "path": "/", "name": "note", "contentHash": "abc123" }
+  ]
+}
+```
+
+**响应：**
+```json
+{
+  "data": {
+    "toUpload": [...],
+    "toDownload": [...],
+    "identical": [...]
+  }
+}
+```
+
+---
+
+```
+POST /api/files/sync
+```
+
+同步结构化文档/批注数据（upsert：有 id 就更新，没有就新建）。
+
+**请求头：**
+- `X-File-Name`: 文件名（必填）
+- `X-Content-Hash`: 文件内容哈希（必填）
+- `X-Doc-Type`: 文档类型（editable / annotation，默认 editable）
+- `X-Parent-Id`: 父文件 id（仅 annotation 时需要）
+- `X-File-Id`: 已有文件 id（可选，传了就是更新）
+
+请求体是文件内容二进制流。
+
+---
+
+### 图片上传（Backblaze B2）
+
+```
+POST /api/images
+```
+
+上传图片到 B2，Worker 中转。
+
+**请求头：**
+- `X-Parent-File-Id`: 所属文档 id（必填）
+- `Content-Type`: 图片 MIME 类型
+
+请求体是图片二进制流。
+
+**响应：**
+```json
+{
+  "data": {
+    "id": "xxx",
+    "url": "/api/images/xxx"
+  }
+}
+```
+
+---
+
+```
+GET /api/images/:id
+```
+
+获取图片，Worker 鉴权代理。直接在 `<img>` 标签里用就行。
+
+---
+
 ## 错误响应格式
 
 普通错误返回统一格式：
