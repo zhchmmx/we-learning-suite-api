@@ -443,6 +443,87 @@ POST /api/files/presign/download/:id
 
 ---
 
+### 文件同步（新）
+
+```
+POST /api/files/sync/check
+```
+
+批量比对本地和服务端的文件列表，返回需要上传和下载的文件。
+
+**请求体：**
+```json
+{
+  "files": [
+    { "id": "xxx", "path": "/", "name": "note", "contentHash": "abc123" }
+  ]
+}
+```
+
+**响应：**
+```json
+{
+  "data": {
+    "toUpload": [...],
+    "toDownload": [...],
+    "identical": [...]
+  }
+}
+```
+
+---
+
+```
+POST /api/files/sync
+```
+
+同步结构化文档/批注数据（upsert：有 id 就更新，没有就新建）。
+
+**请求头：**
+- `X-File-Name`: 文件名（必填）
+- `X-Content-Hash`: 文件内容哈希（必填）
+- `X-Doc-Type`: 文档类型（editable / annotation，默认 editable）
+- `X-Parent-Id`: 父文件 id（仅 annotation 时需要）
+- `X-File-Id`: 已有文件 id（可选，传了就是更新）
+
+请求体是文件内容二进制流。
+
+---
+
+### 图片上传（Backblaze B2）
+
+```
+POST /api/images
+```
+
+上传图片到 B2，Worker 中转。
+
+**请求头：**
+- `X-Parent-File-Id`: 所属文档 id（必填）
+- `Content-Type`: 图片 MIME 类型
+
+请求体是图片二进制流。
+
+**响应：**
+```json
+{
+  "data": {
+    "id": "xxx",
+    "url": "/api/images/xxx"
+  }
+}
+```
+
+---
+
+```
+GET /api/images/:id
+```
+
+获取图片，Worker 鉴权代理。直接在 `<img>` 标签里用就行。
+
+---
+
 ## 错误响应格式
 
 普通错误返回统一格式：
@@ -651,7 +732,30 @@ Authorization: Bearer <jwt>
 
 ---
 
-### 创建 Quiz Session
+### 创建 Quiz（新）
+
+两个新端点，推荐使用：
+
+**1. 从文档生成**
+```
+POST /api/quiz/from-file
+```
+- 传 `sourceFileId`，可选参数：`questionCount`、`difficulty`、`questionTypes`
+- 一个文档可以生成多个 Quiz
+
+**2. 直接写入题目（Agent 用）**
+```
+POST /api/quiz/direct
+```
+- 传 `name` 和 `questions` 数组
+- 每道题的内容、答案、标签、来源文档 id 全由调用方提供
+- 纯写入，不调 AI
+
+---
+
+### 创建 Quiz Session（已弃用）
+
+> ⚠️ 已弃用，请使用上面的新端点。保留是为了兼容旧客户端。
 
 创建 session 的同时，服务端会同步创建 Quiz 实体（status=`generating`），并触发 AI Worker 开始出题。客户端不需要（也无法）接触 AI Worker。
 
