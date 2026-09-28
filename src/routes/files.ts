@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, FileRecord, FileMetadataResponse, ListFilesResponse, StorageQuotaResponse, SyncCheckResponse, ImageRecord } from '../types';
 import { generatePresignedUrl } from '../services/presign';
+import { deleteFromB2 } from '../services/b2';
 import { checkStorageQuota, getStorageQuotaLimit, getStorageUsageBytes } from '../services/storage-quota';
 import { stripExtension, restoreExtension } from '../utils/filename';
 
@@ -583,12 +584,23 @@ files.delete('/:id', async (c) => {
 		);
 	}
 
-	// 删除图片的 D1 记录（B2 对象删除后续补）
+	// 删除图片的 D1 记录和 B2 对象
 	if ((images.results || []).length > 0) {
 		deleteOps.push(
 			c.env.DB.prepare(`DELETE FROM images WHERE parent_file_id = ? AND user_id = ?`).bind(fileId, userId).run()
 		);
-		// TODO: 调用 B2 API 删除对应的图片对象
+		// 并行删除所有图片的 B2 对象
+		for (const image of images.results || []) {
+			deleteOps.push(
+				deleteFromB2({
+					keyId: c.env.B2_KEY_ID,
+					applicationKey: c.env.B2_APPLICATION_KEY,
+					bucket: c.env.B2_BUCKET_NAME,
+					region: c.env.B2_REGION,
+					key: image.b2_key,
+				}).catch(e => console.error('Failed to delete image from B2:', e))
+			);
+		}
 	}
 
 	await Promise.all(deleteOps);

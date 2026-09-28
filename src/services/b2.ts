@@ -80,6 +80,50 @@ export async function uploadToB2(options: B2UploadOptions): Promise<{ size: numb
 }
 
 /**
+ * 从 B2 删除文件
+ */
+export async function deleteFromB2(options: B2GetOptions): Promise<void> {
+	const { keyId, applicationKey, bucket, region, key } = options;
+
+	const host = `s3.${region}.backblazeb2.com`;
+	const url = `https://${host}/${bucket}/${key.split('/').map(encodeURIComponent).join('/')}`;
+
+	const now = new Date();
+	const amzDate = toAmzDate(now);
+	const dateStamp = toDateStamp(now);
+
+	const headers: Record<string, string> = {
+		'host': host,
+		'x-amz-date': amzDate,
+	};
+
+	const canonicalUri = `/${bucket}/${key.split('/').map(encodeURIComponent).join('/')}`;
+	const canonicalQuerystring = '';
+	const signedHeaders = Object.keys(headers).sort().map(h => `${h}:${headers[h]}`).join('\n') + '\n';
+	const signedHeaderKeys = Object.keys(headers).sort().join(';');
+	const payloadHash = 'UNSIGNED-PAYLOAD';
+
+	const canonicalRequest = ['DELETE', canonicalUri, canonicalQuerystring, signedHeaders, signedHeaderKeys, payloadHash].join('\n');
+
+	const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
+	const stringToSign = ['AWS4-HMAC-SHA256', amzDate, credentialScope, await sha256Hex(canonicalRequest)].join('\n');
+
+	const signingKey = await getSignatureKey(applicationKey, dateStamp, region, 's3');
+	const signature = await hmacHex(signingKey, stringToSign);
+
+	headers['Authorization'] = `AWS4-HMAC-SHA256 Credential=${keyId}/${credentialScope}, SignedHeaders=${signedHeaderKeys}, Signature=${signature}`;
+
+	const response = await fetch(url, {
+		method: 'DELETE',
+		headers,
+	});
+
+	if (!response.ok && response.status !== 404) {
+		throw new Error(`B2 delete failed: ${response.status}`);
+	}
+}
+
+/**
  * 从 B2 下载文件
  */
 export async function getFromB2(options: B2GetOptions): Promise<Response> {
