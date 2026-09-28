@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import type { AppEnv, FileRecord, FileMetadataResponse, ListFilesResponse, StorageQuotaResponse } from '../types';
+import type { AppEnv, FileRecord, FileMetadataResponse, ListFilesResponse, StorageQuotaResponse, SyncCheckResponse, ImageRecord } from '../types';
 import { generatePresignedUrl } from '../services/presign';
 import { checkStorageQuota, getStorageQuotaLimit, getStorageUsageBytes } from '../services/storage-quota';
 import { stripExtension, restoreExtension } from '../utils/filename';
@@ -51,6 +51,9 @@ function toResponse(record: FileRecord & { quiz_status?: string | null }): FileM
 		mimeType: record.mime_type,
 		hasThumbnail: !!record.thumbnail_key,
 		quizStatus: (record.quiz_status as FileMetadataResponse['quizStatus']) ?? 'none',
+		docType: record.doc_type,
+		contentHash: record.content_hash,
+		parentId: record.parent_id,
 		createdAt: record.created_at,
 		updatedAt: record.updated_at,
 	};
@@ -105,6 +108,7 @@ files.post('/upload', async (c) => {
 	let mimeType: string;
 	let targetPath: string;
 	let requestedBytes: number | null;
+	let contentHash: string | null;
 
 	if (contentType.includes('multipart/form-data')) {
 		// multipart 表单上传
@@ -120,12 +124,14 @@ files.post('/upload', async (c) => {
 		mimeType = file.type || 'application/octet-stream';
 		targetPath = normalizePath((formData.get('path') as string) || '/');
 		requestedBytes = file.size;
+		contentHash = (formData.get('contentHash') as string) || null;
 	} else {
 		// 原始二进制流上传（客户端直接 PUT/POST body）
 		fileBody = c.req.raw.body as ReadableStream;
 		fileName = decodeURIComponent(c.req.header('X-File-Name') || 'unnamed');
 		mimeType = c.req.header('Content-Type') || 'application/octet-stream';
 		targetPath = normalizePath(decodeURIComponent(c.req.header('X-File-Path') || '/'));
+		contentHash = c.req.header('X-Content-Hash') || null;
 
 		if (!fileBody) {
 			return c.json({ error: 'Empty request body' }, 400);
@@ -182,10 +188,10 @@ files.post('/upload', async (c) => {
 	// 写入 D1 元数据（status 直接为 confirmed，因为文件已上传完成）
 	const now = new Date().toISOString();
 	await c.env.DB.prepare(
-		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)`
+		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, status, content_hash, doc_type, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, 'rendered', ?, ?)`
 	)
-		.bind(fileId, userId, fileName, targetPath, r2Key, putResult.size, mimeType, now, now)
+		.bind(fileId, userId, fileName, targetPath, r2Key, putResult.size, mimeType, contentHash, now, now)
 		.run();
 
 	return c.json({ data: toResponse({
@@ -198,6 +204,9 @@ files.post('/upload', async (c) => {
 		mime_type: mimeType,
 		status: 'confirmed',
 		thumbnail_key: null,
+		content_hash: contentHash,
+		doc_type: 'rendered',
+		parent_id: null,
 		created_at: now,
 		updated_at: now,
 	}) }, 201);
@@ -251,6 +260,203 @@ files.get('/', async (c) => {
 	};
 
 	return c.json({ data: response });
+});
+
+// ===== 同步端点 =====
+
+/**
+ * POST /sync/check
+ * 批量比对本地和服务端的文件列表，返回需要上传和下载的文件
+ *
+ * 请求体 JSON：
+ *   - files: 本地文件列表 [{ id?, path, name, contentHash }]
+ *
+ * 返回：
+ *   - toUpload: 需要上传到服务端的文件
+ *   - toDownload: 需要从服务端下载的文件
+ *   - identical: 两边一致的文件
+ */
+files.post('/sync/check', async (c) => {
+	const userId = c.get('userId');
+
+	let body: { files: Array<{ id?: string; path: string; name: string; contentHash: string }> };
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: 'Invalid JSON body' }, 400);
+	}
+
+	if (!body.files || !Array.isArray(body.files)) {
+		return c.json({ error: '"files" array is required' }, 400);
+	}
+
+	// 查服务端所有 confirmed 文件
+	const serverResult = await c.env.DB.prepare(
+		`SELECT * FROM files WHERE user_id = ? AND status = 'confirmed'`
+	).bind(userId).all<FileRecord>();
+
+	const serverFiles = serverResult.results || [];
+	const serverById = new Map(serverFiles.map(f => [f.id, f]));
+
+	// 客户端传的文件列表
+	const clientFiles = body.files;
+	const clientById = new Map<string, typeof clientFiles[0]>();
+	for (const f of clientFiles) {
+		if (f.id) clientById.set(f.id, f);
+	}
+
+	const toUpload: SyncCheckResponse['toUpload'] = [];
+	const toDownload: SyncCheckResponse['toDownload'] = [];
+	const identical: SyncCheckResponse['identical'] = [];
+
+	// 遍历客户端的文件
+	for (const clientFile of clientFiles) {
+		if (clientFile.id && serverById.has(clientFile.id)) {
+			// 两边都有同 id 的文件，比 hash
+			const serverFile = serverById.get(clientFile.id)!;
+			if (serverFile.content_hash === clientFile.contentHash) {
+				identical.push({ id: clientFile.id, contentHash: clientFile.contentHash });
+			} else {
+				// hash 不一致：初期默认客户端推上去（手动同步场景）
+				toUpload.push({
+					localId: clientFile.id,
+					path: clientFile.path,
+					name: clientFile.name,
+					contentHash: clientFile.contentHash,
+				});
+			}
+		} else {
+			// 客户端新建的，服务端没有
+			toUpload.push({
+				localId: clientFile.id,
+				path: clientFile.path,
+				name: clientFile.name,
+				contentHash: clientFile.contentHash,
+			});
+		}
+	}
+
+	// 遍历服务端的文件，找出客户端没有的
+	for (const serverFile of serverFiles) {
+		if (!clientById.has(serverFile.id)) {
+			toDownload.push({
+				id: serverFile.id,
+				name: stripExtension(serverFile.name),
+				path: serverFile.path,
+				docType: serverFile.doc_type,
+				parentId: serverFile.parent_id,
+				contentHash: serverFile.content_hash,
+				updatedAt: serverFile.updated_at,
+			});
+		}
+	}
+
+	const response: SyncCheckResponse = { toUpload, toDownload, identical };
+	return c.json({ data: response });
+});
+
+/**
+ * POST /sync
+ * 同步结构化文档/批注数据（upsert：有就更新，没有就新建）
+ *
+ * 请求头：
+ *   X-File-Name: 文件名（必填）
+ *   X-File-Path: 目标目录（可选，默认 "/"）
+ *   X-Content-Hash: 文件内容哈希（必填）
+ *   X-Doc-Type: 文档类型（editable | annotation，默认 editable）
+ *   X-Parent-Id: 父文件 id（仅 annotation 时需要）
+ *   X-File-Id: 已有文件 id（可选，传了就是更新，不传就是新建）
+ *   Content-Type: MIME 类型（可选，默认 application/json）
+ *
+ * 请求体：文件内容（二进制流）
+ */
+files.post('/sync', async (c) => {
+	const userId = c.get('userId');
+
+	const fileId = c.req.header('X-File-Id') || '';
+	const fileName = decodeURIComponent(c.req.header('X-File-Name') || '');
+	const targetPath = normalizePath(decodeURIComponent(c.req.header('X-File-Path') || '/'));
+	const contentHash = c.req.header('X-Content-Hash') || '';
+	const docType = (c.req.header('X-Doc-Type') || 'editable') as 'editable' | 'annotation';
+	const parentId = c.req.header('X-Parent-Id') || null;
+	const mimeType = c.req.header('Content-Type') || 'application/json';
+
+	if (!fileName || !isValidFileName(fileName)) {
+		return c.json({ error: 'Valid "X-File-Name" header is required' }, 400);
+	}
+	if (!contentHash) {
+		return c.json({ error: '"X-Content-Hash" header is required' }, 400);
+	}
+	if (docType === 'annotation' && !parentId) {
+		return c.json({ error: '"X-Parent-Id" is required for annotation type' }, 400);
+	}
+
+	const fileBody = c.req.raw.body;
+	if (!fileBody) {
+		return c.json({ error: 'Empty request body' }, 400);
+	}
+
+	const contentLength = parseInt(c.req.header('content-length') || '0', 10);
+	const now = new Date().toISOString();
+
+	// 如果传了 fileId，尝试更新已有文件
+	if (fileId) {
+		const existing = await c.env.DB.prepare(
+			`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`
+		).bind(fileId, userId).first<FileRecord>();
+
+		if (existing) {
+			// 更新已有文件内容
+			await c.env.R2_BUCKET.put(existing.r2_key, fileBody, {
+				httpMetadata: { contentType: mimeType },
+				customMetadata: { fileName, userId, path: targetPath },
+			});
+
+			await c.env.DB.prepare(
+				`UPDATE files SET name = ?, path = ?, size = ?, mime_type = ?, content_hash = ?, doc_type = ?, parent_id = ?, updated_at = ? WHERE id = ? AND user_id = ?`
+			).bind(fileName, targetPath, contentLength, mimeType, contentHash, docType, parentId, now, fileId, userId).run();
+
+			const updated = await c.env.DB.prepare(
+				`SELECT f.*, q.status AS quiz_status
+				 FROM files f
+				 LEFT JOIN quizzes q ON q.source_file_id = f.id AND q.user_id = f.user_id
+				 WHERE f.id = ? AND f.user_id = ? AND f.status = 'confirmed'`
+			).bind(fileId, userId).first<FileRecord & { quiz_status: string | null }>();
+
+			return c.json({ data: toResponse(updated!) });
+		}
+	}
+
+	// 新建文件
+	const newFileId = crypto.randomUUID();
+	const r2Key = generateR2Key(userId, targetPath, newFileId);
+
+	await c.env.R2_BUCKET.put(r2Key, fileBody, {
+		httpMetadata: { contentType: mimeType },
+		customMetadata: { fileName, userId, path: targetPath },
+	});
+
+	await c.env.DB.prepare(
+		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, status, content_hash, doc_type, parent_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?)`
+	).bind(newFileId, userId, fileName, targetPath, r2Key, contentLength, mimeType, contentHash, docType, parentId, now, now).run();
+
+	return c.json({ data: toResponse({
+		id: newFileId,
+		user_id: userId,
+		name: fileName,
+		path: targetPath,
+		r2_key: r2Key,
+		size: contentLength,
+		mime_type: mimeType,
+		status: 'confirmed',
+		thumbnail_key: null,
+		content_hash: contentHash,
+		doc_type: docType,
+		parent_id: parentId,
+		created_at: now,
+		updated_at: now,
+	}) }, 201);
 });
 
 /**
@@ -334,7 +540,7 @@ files.get('/:id/download', async (c) => {
 
 /**
  * DELETE /:id
- * 删除文件（同时删除 R2 对象和 D1 记录）
+ * 删除文件（同时删除 R2 对象、D1 记录、关联的批注和图片）
  */
 files.delete('/:id', async (c) => {
 	const userId = c.get('userId');
@@ -346,14 +552,45 @@ files.delete('/:id', async (c) => {
 		return c.json({ error: 'File not found' }, 404);
 	}
 
-	// 并行删除 R2 对象（含缩略图）和 D1 记录
+	// 查所有关联的批注文件（parent_id = 当前文件 id）
+	const annotations = await c.env.DB.prepare(
+		`SELECT * FROM files WHERE parent_id = ? AND user_id = ?`
+	).bind(fileId, userId).all<FileRecord>();
+
+	// 查所有关联的图片
+	const images = await c.env.DB.prepare(
+		`SELECT * FROM images WHERE parent_file_id = ? AND user_id = ?`
+	).bind(fileId, userId).all<ImageRecord>();
+
+	// 并行删除
 	const deleteOps: Promise<unknown>[] = [
 		c.env.R2_BUCKET.delete(record.r2_key),
 		c.env.DB.prepare(`DELETE FROM files WHERE id = ? AND user_id = ?`).bind(fileId, userId).run(),
 	];
+
+	// 删除缩略图
 	if (record.thumbnail_key) {
 		deleteOps.push(c.env.R2_BUCKET.delete(record.thumbnail_key));
 	}
+
+	// 删除批注文件的 R2 对象和 D1 记录
+	for (const annotation of annotations.results || []) {
+		deleteOps.push(c.env.R2_BUCKET.delete(annotation.r2_key));
+	}
+	if ((annotations.results || []).length > 0) {
+		deleteOps.push(
+			c.env.DB.prepare(`DELETE FROM files WHERE parent_id = ? AND user_id = ?`).bind(fileId, userId).run()
+		);
+	}
+
+	// 删除图片的 D1 记录（B2 对象删除后续补）
+	if ((images.results || []).length > 0) {
+		deleteOps.push(
+			c.env.DB.prepare(`DELETE FROM images WHERE parent_file_id = ? AND user_id = ?`).bind(fileId, userId).run()
+		);
+		// TODO: 调用 B2 API 删除对应的图片对象
+	}
+
 	await Promise.all(deleteOps);
 
 	return c.json({ data: { deleted: true, id: fileId } });
@@ -530,6 +767,7 @@ files.get('/:id/thumbnail', async (c) => {
  *   - path: 目标目录（可选，默认 "/"）
  *   - size: 文件大小（字节，必填）
  *   - mimeType: MIME 类型（可选）
+ *   - contentHash: 文件内容哈希（可选）
  *
  * 返回预签名 URL，客户端直接 PUT 文件到该 URL。
  * ⚠️ 上传完成后必须调用 POST /presign/confirm/:fileId 确认，否则文件不会被列出（防止幽灵文件）。
@@ -537,7 +775,7 @@ files.get('/:id/thumbnail', async (c) => {
 files.post('/presign/upload', async (c) => {
 	const userId = c.get('userId');
 
-	let body: { name: string; path?: string; size: number; mimeType?: string };
+	let body: { name: string; path?: string; size: number; mimeType?: string; contentHash?: string };
 	try {
 		body = await c.req.json();
 	} catch {
@@ -553,6 +791,7 @@ files.post('/presign/upload', async (c) => {
 
 	const targetPath = normalizePath(body.path || '/');
 	const mimeType = body.mimeType || 'application/octet-stream';
+	const contentHash = body.contentHash || null;
 
 	// 格式白名单校验（与 /upload 一致）
 	if (!isAllowedUploadMime(mimeType)) {
@@ -582,10 +821,10 @@ files.post('/presign/upload', async (c) => {
 	// 先在 D1 中创建记录，状态为 pending（等待客户端上传完成后 confirm）
 	const now = new Date().toISOString();
 	await c.env.DB.prepare(
-		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+		`INSERT INTO files (id, user_id, name, path, r2_key, size, mime_type, status, content_hash, doc_type, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'rendered', ?, ?)`
 	)
-		.bind(fileId, userId, body.name, targetPath, r2Key, body.size, mimeType, now, now)
+		.bind(fileId, userId, body.name, targetPath, r2Key, body.size, mimeType, contentHash, now, now)
 		.run();
 
 	// 生成预签名上传 URL

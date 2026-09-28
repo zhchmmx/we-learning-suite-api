@@ -38,7 +38,7 @@ function mockSubscriptionMeFailure() {
 
 // ===== D1 测试数据 =====
 
-/** 与 migrations 最终结构一致的 files 表（0001 + 0003 + 0004） */
+/** 与 migrations 最终结构一致的 files 表（0001 + 0003 + 0004 + 0010） */
 const FILES_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS files (
 	id TEXT PRIMARY KEY,
@@ -50,8 +50,21 @@ CREATE TABLE IF NOT EXISTS files (
 	mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
 	thumbnail_key TEXT,
 	status TEXT NOT NULL DEFAULT 'confirmed',
+	content_hash TEXT,
+	doc_type TEXT NOT NULL DEFAULT 'rendered',
+	parent_id TEXT,
 	created_at TEXT NOT NULL DEFAULT (datetime('now')),
 	updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS images (
+	id TEXT PRIMARY KEY,
+	user_id TEXT NOT NULL,
+	parent_file_id TEXT NOT NULL,
+	b2_key TEXT NOT NULL,
+	content_hash TEXT,
+	mime_type TEXT NOT NULL,
+	size INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL DEFAULT (datetime('now'))
 )`;
 
 async function seedFile(opts: { id: string; userId: string; size: number; status?: 'confirmed' | 'pending' }) {
