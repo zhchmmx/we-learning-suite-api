@@ -743,6 +743,29 @@ POST /api/quiz/from-file
 - 传 `sourceFileId`，可选参数：`questionCount`、`difficulty`、`questionTypes`
 - 一个文档可以生成多个 Quiz
 
+**示例：**
+```bash
+curl -X POST https://your-worker.workers.dev/api/quiz/from-file \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceFileId": "file-uuid",
+    "name": "第三章复习",
+    "questionCount": 20,
+    "difficulty": "medium"
+  }'
+```
+
+**响应：**
+```json
+{
+  "data": {
+    "quizId": "quiz-uuid",
+    "status": "generating"
+  }
+}
+```
+
 **2. 直接写入题目（Agent 用）**
 ```
 POST /api/quiz/direct
@@ -750,6 +773,37 @@ POST /api/quiz/direct
 - 传 `name` 和 `questions` 数组
 - 每道题的内容、答案、标签、来源文档 id 全由调用方提供
 - 纯写入，不调 AI
+
+**示例：**
+```bash
+curl -X POST https://your-worker.workers.dev/api/quiz/direct \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "我的复习测验",
+    "questions": [
+      {
+        "type": "single-choice",
+        "content": "{\"question\": \"1+1=?\", \"options\": [\"1\", \"2\", \"3\"]}",
+        "answer": "{\"answer\": \"2\"}",
+        "tags": ["数学", "基础"],
+        "sourceFileId": "abc123"
+      }
+    ]
+  }'
+```
+
+**响应：**
+```json
+{
+  "data": {
+    "id": "quiz-uuid",
+    "name": "我的复习测验",
+    "questionCount": 1,
+    "status": "completed"
+  }
+}
+```
 
 ---
 
