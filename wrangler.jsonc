@@ -45,6 +45,52 @@
 		"APPWRITE_FUNCTION_ID": "6a784dd9002e0069cf39"
 	}
 
+	{
+		"previews": {
+			"vars": {
+				"APPWRITE_ENDPOINT": "https://sgp.cloud.appwrite.io/v1",
+				"APPWRITE_FUNCTION_ID": "6a784dd9002e0069cf39",
+				"APPWRITE_PROJECT_ID": "6a6c7036001a06ffc393"
+			},
+			"unsafe": {
+				"bindings": [
+					{
+						"name": "AI_WORKER",
+						"type": "service",
+						"service": "we-learning-suite-ai",
+						"environment": "production"
+					}
+				]
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_id": "3d5795c9-b196-4c0b-8226-d2ec845d0c05"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "R2_BUCKET",
+					"bucket_name": "we-learning-suite-preview"
+				}
+			],
+			"observability": {
+				"logs": {
+					"enabled": true,
+					"head_sampling_rate": 1,
+					"invocation_logs": true,
+					"persist": true
+				},
+				"traces": {
+					"enabled": false,
+					"head_sampling_rate": 1,
+					"persist": true
+				}
+			}
+		}
+	}
+
+
 	// 以下变量通过 `npx wrangler secret put <NAME>` 设置，不写在配置文件里：
 	// R2_ACCESS_KEY_ID     - R2 S3 API 的 Access Key（用于生成预签名 URL）
 	// R2_SECRET_ACCESS_KEY - R2 S3 API 的 Secret Key
