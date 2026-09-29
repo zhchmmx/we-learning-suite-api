@@ -1030,4 +1030,198 @@ quiz.post('/answers', authMiddleware, async (c) => {
 	return c.json({ data: { recorded: statements.length / 2 } }, 201);
 });
 
+// ===== 新端点：解耦后的 Quiz 创建 =====
+
+/**
+ * POST /quizzes/direct
+ * 直接创建 Quiz 并写入题目（Agent 用的，不经过文档生成）
+ *
+ * 请求体 JSON：
+ *   - name: Quiz 名称（必填）
+ *   - questions: 题目数组（必填）
+ *     - type: 题型（必填）
+ *     - content: 题目内容（必填，JSON 字符串）
+ *     - answer: 答案（必填，JSON 字符串）
+ *     - tags: 标签数组（可选）
+ *     - sourceFileId: 来源文档 id（可选）
+ */
+quiz.post('/quizzes/direct', authMiddleware, async (c) => {
+	const userId = c.get('userId');
+
+	let body: {
+		name: string;
+		questions: Array<{
+			type: string;
+			content: string;
+			answer: string;
+			tags?: string[];
+			sourceFileId?: string;
+		}>;
+	};
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: 'Invalid JSON body' }, 400);
+	}
+
+	if (!body.name || typeof body.name !== 'string') {
+		return c.json({ error: '"name" is required' }, 400);
+	}
+	if (!body.questions || !Array.isArray(body.questions) || body.questions.length === 0) {
+		return c.json({ error: '"questions" array is required' }, 400);
+	}
+
+	const quizId = crypto.randomUUID();
+	const now = new Date().toISOString();
+
+	// 创建 Quiz 记录（status 直接 completed，因为题目已经写好了）
+	await c.env.DB.prepare(
+		`INSERT INTO quizzes (id, user_id, source_file_id, name, status, created_at, updated_at)
+		 VALUES (?, ?, NULL, ?, 'completed', ?, ?)`
+	)
+		.bind(quizId, userId, body.name, now, now)
+		.run();
+
+	// 批量插入题目
+	const statements = body.questions.map((q) => {
+		const questionId = crypto.randomUUID();
+		return c.env.DB.prepare(
+			`INSERT INTO questions (id, user_id, quiz_id, type, content, answer, tags, source_file_id, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		).bind(
+			questionId,
+			userId,
+			quizId,
+			q.type,
+			q.content,
+			q.answer,
+			q.tags ? JSON.stringify(q.tags) : null,
+			q.sourceFileId || null,
+			now,
+			now
+		);
+	});
+
+	await c.env.DB.batch(statements);
+
+	return c.json({
+		data: {
+			id: quizId,
+			name: body.name,
+			questionCount: body.questions.length,
+			status: 'completed',
+			createdAt: now,
+			updatedAt: now,
+		},
+	}, 201);
+});
+
+/**
+ * POST /quizzes/from-file
+ * 从文档生成 Quiz（支持自定义参数：题数、难度、题型等）
+ *
+ * 请求体 JSON：
+ *   - sourceFileId: 来源文档 id（必填）
+ *   - name: Quiz 名称（可选，默认用文档名）
+ *   - questionCount: 题目数量（可选）
+ *   - difficulty: 难度（可选）
+ *   - questionTypes: 题型数组（可选）
+ *   - 其他参数后续扩展
+ */
+quiz.post('/quizzes/from-file', authMiddleware, async (c) => {
+	const userId = c.get('userId');
+
+	let body: {
+		sourceFileId: string;
+		name?: string;
+		questionCount?: number;
+		difficulty?: string;
+		questionTypes?: string[];
+	};
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: 'Invalid JSON body' }, 400);
+	}
+
+	if (!body.sourceFileId) {
+		return c.json({ error: '"sourceFileId" is required' }, 400);
+	}
+
+	// 验证文件存在且属于该用户
+	const file = await c.env.DB.prepare(`SELECT * FROM files WHERE id = ? AND user_id = ? AND status = 'confirmed'`)
+		.bind(body.sourceFileId, userId)
+		.first<{ id: string; r2_key: string; name: string; mime_type: string }>();
+
+	if (!file) {
+		return c.json({ error: 'Source file not found' }, 404);
+	}
+
+	if (!isAllowedUploadMime(file.mime_type)) {
+		return c.json({
+			error: '该文件格式不支持生成题目。请上传 txt / markdown / PDF / docx / xlsx / jpg / png / webp 格式',
+		}, 415);
+	}
+
+	// 新逻辑：不再限制一个文档只能有一个 Quiz
+	// 直接创建新的 Quiz 和 session
+	const quizId = crypto.randomUUID();
+	const now = new Date();
+	const expiresAt = new Date(now.getTime() + TICKET_TTL_SECONDS * 1000);
+	const quizName = body.name || stripExtension(file.name);
+
+	try {
+		// 创建 Quiz 记录
+		await c.env.DB.prepare(
+			`INSERT INTO quizzes (id, user_id, source_file_id, name, status, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'generating', ?, ?)`
+		)
+			.bind(quizId, userId, body.sourceFileId, quizName, now.toISOString(), now.toISOString())
+			.run();
+
+		// 创建出题会话
+		await c.env.DB.prepare(
+			`INSERT INTO quiz_sessions (id, user_id, quiz_id, source_file_id, status, expires_at, created_at)
+			 VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+		)
+			.bind(quizId, userId, quizId, body.sourceFileId, expiresAt.toISOString(), now.toISOString())
+			.run();
+	} catch (err) {
+		console.error('DB error during quiz creation:', err);
+		return c.json({ error: '数据库异常，请稍后重试' }, 500);
+	}
+
+	// 触发 AI Worker
+	try {
+		await c.env.AI_WORKER.fetch('http://we-learning-suite-ai/api/quiz/generate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				ticket: quizId,
+				userId,
+				materials: [{ r2Key: file.r2_key, mimeType: file.mime_type }],
+				options: {
+					questionCount: body.questionCount,
+					difficulty: body.difficulty,
+					questionTypes: body.questionTypes,
+				},
+			}),
+			signal: AbortSignal.timeout(15000),
+		});
+	} catch (e) {
+		console.error('Failed to trigger AI worker:', e);
+		// 不返回错误给客户端，AI Worker 是异步的，客户端轮询状态即可
+	}
+
+	return c.json({
+		data: {
+			quizId,
+			sessionId: quizId,
+			sourceFileName: stripExtension(file.name),
+			status: 'generating',
+			expiresIn: TICKET_TTL_SECONDS,
+		},
+	}, 201);
+});
+
 export { quiz };
