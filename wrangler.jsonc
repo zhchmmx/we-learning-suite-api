@@ -11,8 +11,9 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
-	"compatibility_flags": ["nodejs_compat"],
-
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
 	// R2 对象存储绑定 —— 存储文件本体
 	"r2_buckets": [
 		{
@@ -20,7 +21,6 @@
 			"bucket_name": "we-learning-suite"
 		}
 	],
-
 	// D1 数据库绑定 —— 存储文件元数据
 	"d1_databases": [
 		{
@@ -29,7 +29,6 @@
 			"database_id": "7d4d5368-03af-4bfe-9a17-92a6cff2ebf1"
 		}
 	],
-
 	// Service Binding —— 内部直连出题 AI Worker（不走公网，无需 URL 和令牌）
 	"services": [
 		{
@@ -37,58 +36,55 @@
 			"service": "we-learning-suite-ai"
 		}
 	],
-
 	// 非敏感环境变量（敏感信息用 wrangler secret put 设置）
 	"vars": {
 		"APPWRITE_ENDPOINT": "https://sgp.cloud.appwrite.io/v1",
 		"APPWRITE_PROJECT_ID": "6a6c7036001a06ffc393",
 		"APPWRITE_FUNCTION_ID": "6a784dd9002e0069cf39"
-	}
-
-	{
-		"previews": {
-			"vars": {
-				"APPWRITE_ENDPOINT": "https://sgp.cloud.appwrite.io/v1",
-				"APPWRITE_FUNCTION_ID": "6a784dd9002e0069cf39",
-				"APPWRITE_PROJECT_ID": "6a6c7036001a06ffc393"
-			},
-			"unsafe": {
-				"bindings": [
-					{
-						"name": "AI_WORKER",
-						"type": "service",
-						"service": "we-learning-suite-ai",
-						"environment": "production"
-					}
-				]
-			},
-			"d1_databases": [
+	},
+	"previews": {
+		"vars": {
+			"APPWRITE_ENDPOINT": "https://sgp.cloud.appwrite.io/v1",
+			"APPWRITE_FUNCTION_ID": "6a784dd9002e0069cf39",
+			"APPWRITE_PROJECT_ID": "6a6c7036001a06ffc393"
+		},
+		"unsafe": {
+			"bindings": [
 				{
-					"binding": "DB",
-					"database_id": "3d5795c9-b196-4c0b-8226-d2ec845d0c05"
+					"name": "AI_WORKER",
+					"type": "service",
+					"service": "we-learning-suite-ai",
+					"environment": "production"
 				}
-			],
-			"r2_buckets": [
-				{
-					"binding": "R2_BUCKET",
-					"bucket_name": "we-learning-suite-preview"
-				}
-			],
-			"observability": {
-				"logs": {
-					"enabled": true,
-					"head_sampling_rate": 1,
-					"invocation_logs": true,
-					"persist": true
-				},
-				"traces": {
-					"enabled": false,
-					"head_sampling_rate": 1,
-					"persist": true
-				}
+			]
+		},
+		"d1_databases": [
+			{
+				"binding": "DB",
+				"database_id": "3d5795c9-b196-4c0b-8226-d2ec845d0c05"
+			}
+		],
+		"r2_buckets": [
+			{
+				"binding": "R2_BUCKET",
+				"bucket_name": "we-learning-suite-preview"
+			}
+		],
+		"observability": {
+			"logs": {
+				"enabled": true,
+				"head_sampling_rate": 1,
+				"invocation_logs": true,
+				"persist": true
+			},
+			"traces": {
+				"enabled": false,
+				"head_sampling_rate": 1,
+				"persist": true
 			}
 		}
 	}
+
 
 
 	// 以下变量通过 `npx wrangler secret put <NAME>` 设置，不写在配置文件里：
