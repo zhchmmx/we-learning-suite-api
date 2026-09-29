@@ -1,0 +1,11 @@
+// wrangler.preview-migrations.jsonc
+{
+	"d1_databases": [
+		{
+			"binding": "PREVIEW_DB",        // 可以随便起名，跟运行时 binding 无关
+			"database_name": "we-learning-suite-preview",
+			"database_id": "3d5795c9-b196-4c0b-8226-d2ec845d0c05",  // 关键：预览库 ID 放顶层
+			"migrations_dir": "migrations"
+		}
+	]
+}
