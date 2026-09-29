@@ -79,7 +79,7 @@ quiz.get('/quizzes', authMiddleware, async (c) => {
 			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ?) AS total_questions,
 			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ? AND graduated = 1) AS graduated_questions
 		FROM quizzes q
-		JOIN files f ON q.source_file_id = f.id
+		LEFT JOIN files f ON q.source_file_id = f.id
 		WHERE q.user_id = ?
 		ORDER BY q.created_at DESC
 	`)
@@ -100,7 +100,7 @@ quiz.get('/quizzes', authMiddleware, async (c) => {
 		id: q.id as string,
 		name: q.name as string,
 		sourceFileId: q.source_file_id as string,
-		sourceFileName: stripExtension(q.source_file_name as string),
+		sourceFileName: q.source_file_name ? stripExtension(q.source_file_name as string) : '',
 		totalQuestions: q.total_questions as number,
 		graduatedQuestions: q.graduated_questions as number,
 		status: q.status as 'generating' | 'completed' | 'failed',
@@ -125,7 +125,7 @@ quiz.get('/quizzes/:id', authMiddleware, async (c) => {
 			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ?) AS total_questions,
 			(SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND user_id = ? AND graduated = 1) AS graduated_questions
 		FROM quizzes q
-		JOIN files f ON q.source_file_id = f.id
+		LEFT JOIN files f ON q.source_file_id = f.id
 		WHERE q.id = ? AND q.user_id = ?
 	`)
 		.bind(userId, userId, quizId, userId)
@@ -140,7 +140,7 @@ quiz.get('/quizzes/:id', authMiddleware, async (c) => {
 			id: q.id,
 			name: q.name,
 			sourceFileId: q.source_file_id,
-			sourceFileName: stripExtension(q.source_file_name as string),
+			sourceFileName: q.source_file_name ? stripExtension(q.source_file_name as string) : '',
 			totalQuestions: q.total_questions,
 			graduatedQuestions: q.graduated_questions,
 			status: q.status,
