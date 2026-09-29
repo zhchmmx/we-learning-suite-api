@@ -4,6 +4,7 @@ import * as Sentry from '@sentry/cloudflare';
 import type { AppEnv } from './types';
 import { authMiddleware } from './auth';
 import { files } from './routes/files';
+import { images } from './routes/images';
 import { quiz } from './routes/quiz';
 import { usage } from './routes/usage';
 
@@ -15,7 +16,18 @@ app.use(
 	cors({
 		origin: '*',
 		allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-		allowHeaders: ['Content-Type', 'Authorization', 'X-File-Name', 'X-File-Path', 'X-Quiz-Ticket'],
+		allowHeaders: [
+			'Content-Type',
+			'Authorization',
+			'X-File-Name',
+			'X-File-Path',
+			'X-File-Id',
+			'X-Content-Hash',
+			'X-Doc-Type',
+			'X-Parent-Id',
+			'X-Parent-File-Id',
+			'X-Quiz-Ticket',
+		],
 	})
 );
 
@@ -27,6 +39,10 @@ app.get('/health', (c) => {
 // 文件管理路由（鉴权在各路由内部处理）
 app.use('/api/files/*', authMiddleware);
 app.route('/api/files', files);
+
+// 图片路由（鉴权）
+app.use('/api/images/*', authMiddleware);
+app.route('/api/images', images);
 
 // We Quiz 路由（鉴权在各路由内部处理：JWT 或 ticket）
 app.route('/api/quiz', quiz);

@@ -443,7 +443,7 @@ POST /api/files/presign/download/:id
 
 ---
 
-### 文件同步（新）
+### 文件同步
 
 ```
 POST /api/files/sync/check

@@ -17,6 +17,12 @@ export interface AppEnv {
 		R2_ACCESS_KEY_ID: string;
 		R2_SECRET_ACCESS_KEY: string;
 		CLOUDFLARE_ACCOUNT_ID: string;
+		// Backblaze B2 图片存储（密钥后续通过 wrangler secret put 设置）
+		B2_KEY_ID: string;
+		B2_APPLICATION_KEY: string;
+		B2_BUCKET_NAME: string;
+		B2_BUCKET_ID: string;
+		B2_REGION: string;
 	};
 	Variables: {
 		userId: string;
@@ -34,6 +40,9 @@ export interface FileRecord {
 	mime_type: string;
 	status: 'confirmed' | 'pending';
 	thumbnail_key: string | null;
+	content_hash: string | null;
+	doc_type: 'rendered' | 'editable' | 'annotation';
+	parent_id: string | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -52,6 +61,12 @@ export interface FileMetadataResponse {
 	hasThumbnail: boolean;
 	/** 文档的 quiz 生成状态：none=从未出题，generating=生成中，completed=已成功生成，failed=生成失败 */
 	quizStatus: 'none' | 'generating' | 'completed' | 'failed';
+	/** 文档类型：rendered=PDF/Office 原文档，editable=结构化笔记，annotation=挂在 rendered 上的批注 */
+	docType: 'rendered' | 'editable' | 'annotation';
+	/** 文件内容哈希，用于同步比对 */
+	contentHash: string | null;
+	/** 批注数据关联的原文件 id（仅 doc_type=annotation 时有值） */
+	parentId: string | null;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -106,4 +121,51 @@ export interface QuizListItem {
 	status: 'generating' | 'completed' | 'failed';
 	createdAt: string;
 	updatedAt: string;
+}
+
+/** 图片元数据记录（存储在 Backblaze B2） */
+export interface ImageRecord {
+	id: string;
+	user_id: string;
+	parent_file_id: string;
+	b2_key: string;
+	content_hash: string | null;
+	mime_type: string;
+	size: number;
+	created_at: string;
+}
+
+/** 同步比对请求项 */
+export interface SyncCheckItem {
+	/** 文件 id（本地新建的文件没有 id，传空字符串或不传） */
+	id?: string;
+	path: string;
+	name: string;
+	contentHash: string;
+}
+
+/** 同步比对响应 */
+export interface SyncCheckResponse {
+	/** 本地有但服务端没有，或本地 hash 更新 → 需要上传 */
+	toUpload: Array<{
+		localId?: string;
+		path: string;
+		name: string;
+		contentHash: string;
+	}>;
+	/** 服务端有但本地没有，或服务端 hash 更新 → 需要下载 */
+	toDownload: Array<{
+		id: string;
+		name: string;
+		path: string;
+		docType: 'rendered' | 'editable' | 'annotation';
+		parentId: string | null;
+		contentHash: string | null;
+		updatedAt: string;
+	}>;
+	/** 两边一致 */
+	identical: Array<{
+		id: string;
+		contentHash: string;
+	}>;
 }
